@@ -1,0 +1,1097 @@
+"""Acceptance tests for Atesto v0."""
+
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+ENV = {**os.environ, "PYTHONPATH": str(SRC)}
+
+
+def cli(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "atesto", *args],
+        cwd=repo,
+        env=ENV,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def git(repo: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stderr)
+    return result.stdout.strip()
+
+
+def make_repo(tmp: str) -> Path:
+    repo = Path(tmp) / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    git(repo, "config", "user.email", "atesto@example.com")
+    git(repo, "config", "user.name", "Atesto")
+    git(repo, "config", "commit.gpgsign", "false")
+    (repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+    git(repo, "add", "app.py")
+    git(repo, "commit", "-qm", "base")
+    return repo
+
+
+def init(
+    repo: Path, *, require: str = "proof", test_cmd: str = ""
+) -> None:
+    result = cli(
+        repo, "init", "--require", require, "--test-cmd", test_cmd
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def proof(repo: Path, *, command: str = "print('ok')") -> None:
+    result = cli(
+        repo,
+        "proof",
+        "demo",
+        "--",
+        sys.executable,
+        "-c",
+        command,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def commit(repo: Path, message: str = "evidence") -> None:
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", message)
+
+
+class AtestoTest(unittest.TestCase):
+    def test_proof_check_and_artifact_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            proof(repo)
+            commit(repo)
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("atesto: ok", result.stdout)
+
+    def test_review_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof,review")
+            proof(repo)
+            commit(repo)
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("review.json ausente", result.stdout)
+
+            result = cli(
+                repo,
+                "review",
+                "demo",
+                "--head",
+                "HEAD",
+                "--verdict",
+                "APPROVED",
+                "--reviewer",
+                "reviewer",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            commit(repo, "review")
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_stale_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            proof(repo)
+            commit(repo)
+            self.assertEqual(cli(repo, "check").returncode, 0)
+
+            (repo / "app.py").write_text("x = 2\n", encoding="utf-8")
+            commit(repo, "code")
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("prova stale", result.stdout)
+
+    def test_failed_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            result = cli(
+                repo,
+                "proof",
+                "demo",
+                "--",
+                sys.executable,
+                "-c",
+                "raise SystemExit(3)",
+            )
+            self.assertEqual(result.returncode, 3)
+            commit(repo)
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("exit=3", result.stdout)
+
+    def test_output_tamper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            proof(repo)
+            output = repo / "docs" / "atesto" / "demo" / "proof-output.txt"
+            output.write_text("adulterado\n", encoding="utf-8")
+            commit(repo)
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("output", result.stdout)
+
+    def test_review_opcional_stale_falha(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            proof(repo)
+            commit(repo)
+            cli(
+                repo,
+                "review",
+                "demo",
+                "--head",
+                "HEAD",
+                "--verdict",
+                "CHANGES_REQUESTED",
+                "--reviewer",
+                "reviewer",
+            )
+            commit(repo, "review opcional")
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("APPROVED", result.stdout)
+
+    def test_output_sha_mesmo_tamanho(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            proof(repo)
+            output = repo / "docs" / "atesto" / "demo" / "proof-output.txt"
+            output.write_text("no\n", encoding="utf-8")
+            commit(repo)
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("sha256", result.stdout)
+
+    def test_review_symlink_reprova(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof,review")
+            proof(repo)
+            commit(repo)
+            cli(
+                repo,
+                "review",
+                "demo",
+                "--head",
+                "HEAD",
+                "--verdict",
+                "APPROVED",
+                "--reviewer",
+                "reviewer",
+            )
+            review = repo / "docs" / "atesto" / "demo" / "review.json"
+            original = Path(tmp) / "outside-review.json"
+            original.write_bytes(review.read_bytes())
+            review.unlink()
+            review.symlink_to(original)
+            commit(repo, "review symlink")
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("review.json", result.stdout)
+
+    def test_review_tree_tamper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof,review")
+            proof(repo)
+            commit(repo)
+            cli(
+                repo,
+                "review",
+                "demo",
+                "--head",
+                "HEAD",
+                "--verdict",
+                "APPROVED",
+                "--reviewer",
+                "reviewer",
+            )
+            review = repo / "docs" / "atesto" / "demo" / "review.json"
+            data = json.loads(review.read_text(encoding="utf-8"))
+            data["tree_sha256"] = "0" * 64
+            review.write_text(json.dumps(data), encoding="utf-8")
+            commit(repo, "tamper")
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("tree_sha256", result.stdout)
+
+    def test_ci_happy_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            commit(repo, "config")
+            base = git(repo, "rev-parse", "HEAD")
+            git(repo, "checkout", "-qb", "feature")
+            proof(repo)
+            commit(repo, "evidence")
+            cli(
+                repo,
+                "review",
+                "demo",
+                "--head",
+                "HEAD",
+                "--verdict",
+                "APPROVED",
+                "--reviewer",
+                "reviewer",
+            )
+            commit(repo, "review")
+            result = cli(repo, "check", "--ci", "--base", base)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_review_stale_after_code_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof,review")
+            proof(repo)
+            commit(repo)
+            cli(
+                repo,
+                "review",
+                "demo",
+                "--head",
+                "HEAD",
+                "--verdict",
+                "APPROVED",
+                "--reviewer",
+                "reviewer",
+            )
+            commit(repo, "review")
+            (repo / "app.py").write_text("x = 9\n", encoding="utf-8")
+            commit(repo, "code")
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("stale", result.stdout + result.stderr)
+
+    def test_ci_uses_base_config_not_pr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof,review")
+            commit(repo, "config")
+            base = git(repo, "rev-parse", "HEAD")
+            git(repo, "checkout", "-qb", "feature")
+            proof(repo)
+            commit(repo, "evidence")
+            config = json.loads(
+                (repo / "atesto.json").read_text(encoding="utf-8")
+            )
+            config["require"] = ["proof"]
+            (repo / "atesto.json").write_text(
+                json.dumps(config), encoding="utf-8"
+            )
+            commit(repo, "weaken config")
+            result = cli(repo, "check", "--ci", "--base", base)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(
+                "config do HEAD remove requisito", result.stdout + result.stderr
+            )
+
+    def test_ci_rejects_head_config_deletion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            commit(repo, "config")
+            base = git(repo, "rev-parse", "HEAD")
+            git(repo, "checkout", "-qb", "feature")
+            (repo / "atesto.json").unlink()
+            commit(repo, "remove config")
+            result = cli(repo, "check", "--ci", "--base", base)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(
+                "config do Atesto ausente no HEAD",
+                result.stdout + result.stderr,
+            )
+
+    def test_ci_rejects_added_test_cmd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            commit(repo, "config")
+            base = git(repo, "rev-parse", "HEAD")
+            git(repo, "checkout", "-qb", "feature")
+            proof(repo)
+            commit(repo, "evidence")
+            config = json.loads(
+                (repo / "atesto.json").read_text(encoding="utf-8")
+            )
+            config["test_cmd"] = "echo added"
+            (repo / "atesto.json").write_text(
+                json.dumps(config), encoding="utf-8"
+            )
+            commit(repo, "add test cmd")
+            result = cli(repo, "check", "--ci", "--base", base)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("test_cmd", result.stdout + result.stderr)
+
+    def test_ci_uses_committed_head_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof,review")
+            commit(repo, "config")
+            base = git(repo, "rev-parse", "HEAD")
+            git(repo, "checkout", "-qb", "feature")
+            proof(repo)
+            commit(repo, "evidence")
+            config = json.loads(
+                (repo / "atesto.json").read_text(encoding="utf-8")
+            )
+            config["require"] = ["proof"]
+            (repo / "atesto.json").write_text(
+                json.dumps(config), encoding="utf-8"
+            )
+            commit(repo, "weak config")
+            config["require"] = ["proof", "review"]
+            (repo / "atesto.json").write_text(
+                json.dumps(config), encoding="utf-8"
+            )
+            result = cli(repo, "check", "--ci", "--base", base)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("config do HEAD remove", result.stdout + result.stderr)
+
+    def test_hooks_install_fora_de_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = cli(Path(tmp), "hooks", "install")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("nao e um repo git", result.stderr)
+
+    def test_ci_rejects_weakening_fields(self) -> None:
+        cases = [
+            ("min_reviewers", 2, 1, "min_reviewers"),
+            ("artifacts_root", "docs/atesto", "docs/other", "artifacts_root"),
+            ("fingerprint_excludes", [], ["vendor"], "excludes"),
+            (
+                "review_artifacts_paths",
+                ["docs/atesto"],
+                ["docs/atesto", "other"],
+                "review_artifacts_paths",
+            ),
+        ]
+        for field, base_value, head_value, expected in cases:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                repo = make_repo(tmp)
+                init(repo)
+                config_path = repo / "atesto.json"
+                config = json.loads(
+                    config_path.read_text(encoding="utf-8")
+                )
+                config[field] = base_value
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+                commit(repo, "base config")
+                base = git(repo, "rev-parse", "HEAD")
+                git(repo, "checkout", "-qb", "feature")
+                proof(repo)
+                commit(repo, "evidence")
+                config = json.loads(
+                    config_path.read_text(encoding="utf-8")
+                )
+                config[field] = head_value
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+                commit(repo, "weaken")
+                result = cli(repo, "check", "--ci", "--base", base)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(
+                    expected, result.stdout + result.stderr
+                )
+
+    def test_ci_remove_exclude_nao_fica_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            config_path = repo / "atesto.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["fingerprint_excludes"] = ["vendor"]
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            commit(repo, "base exclude")
+            base = git(repo, "rev-parse", "HEAD")
+            git(repo, "checkout", "-qb", "feature")
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["fingerprint_excludes"] = []
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            (repo / "vendor").mkdir()
+            (repo / "vendor" / "lib.py").write_text("v = 1\n", encoding="utf-8")
+            commit(repo, "remove exclude")
+            proof(repo)
+            commit(repo, "evidence")
+            result = cli(repo, "check", "--ci", "--base", base)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_ci_ignora_worktree_sujo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            commit(repo, "config")
+            base = git(repo, "rev-parse", "HEAD")
+            git(repo, "checkout", "-qb", "feature")
+            proof(repo)
+            commit(repo, "evidence")
+            (repo / "app.py").write_text("x = 77\n", encoding="utf-8")
+            result = cli(repo, "check", "--ci", "--base", base)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+
+    def test_ci_requires_config_in_base(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            proof(repo)
+            result = cli(repo, "check", "--ci", "--base", "HEAD")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("nao existe na base", result.stdout + result.stderr)
+
+    def test_ci_requires_artifact_in_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            commit(repo, "config")
+            git(repo, "checkout", "-qb", "feature")
+            proof(repo)
+            result = cli(repo, "check", "--ci", "--base", "HEAD")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("diff do PR", result.stdout + result.stderr)
+
+    def test_dirty_tree_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            (repo / "app.py").write_text("x = 3\n", encoding="utf-8")
+            proof(repo)
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_test_cmd_runs_and_fails_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, test_cmd="false")
+            proof(repo)
+            commit(repo)
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("test_cmd falhou", result.stdout)
+
+    def test_two_valid_artifacts_choose_latest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            for slug in ("alpha", "beta"):
+                result = cli(
+                    repo,
+                    "proof",
+                    slug,
+                    "--",
+                    sys.executable,
+                    "-c",
+                    f"print('{slug}')",
+                )
+                self.assertEqual(
+                    result.returncode, 0, result.stdout + result.stderr
+                )
+                commit(repo, slug)
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_multiple_artifacts_selects_current_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            result = cli(
+                repo,
+                "proof",
+                "alpha",
+                "--",
+                sys.executable,
+                "-c",
+                "print('alpha')",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            commit(repo, "alpha")
+            (repo / "app.py").write_text("x = 2\n", encoding="utf-8")
+            commit(repo, "code")
+            result = cli(
+                repo,
+                "proof",
+                "beta",
+                "--",
+                sys.executable,
+                "-c",
+                "print('beta')",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            commit(repo, "beta")
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def _future_commit(self, repo: Path) -> str:
+        tree = git(repo, "rev-parse", "HEAD^{tree}")
+        return git(repo, "commit-tree", tree, "-p", "HEAD", "-m", "future")
+
+    def test_proof_head_future_reprova(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            proof(repo)
+            commit(repo)
+            future = self._future_commit(repo)
+            proof_path = repo / "docs" / "atesto" / "demo" / "proof.json"
+            data = json.loads(proof_path.read_text(encoding="utf-8"))
+            data["head"] = future
+            proof_path.write_text(json.dumps(data), encoding="utf-8")
+            commit(repo, "future head")
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("ancestral", result.stdout)
+
+    def test_review_head_future_reprova(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof,review")
+            proof(repo)
+            commit(repo)
+            cli(
+                repo,
+                "review",
+                "demo",
+                "--head",
+                "HEAD",
+                "--verdict",
+                "APPROVED",
+                "--reviewer",
+                "reviewer",
+            )
+            commit(repo)
+            future = self._future_commit(repo)
+            review_path = repo / "docs" / "atesto" / "demo" / "review.json"
+            data = json.loads(review_path.read_text(encoding="utf-8"))
+            data["head"] = future
+            review_path.write_text(json.dumps(data), encoding="utf-8")
+            commit(repo, "future review")
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("ancestral", result.stdout + result.stderr)
+
+    def test_review_verdict_reprova(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof,review")
+            proof(repo)
+            commit(repo)
+            cli(
+                repo,
+                "review",
+                "demo",
+                "--head",
+                "HEAD",
+                "--verdict",
+                "CHANGES_REQUESTED",
+                "--reviewer",
+                "reviewer",
+            )
+            commit(repo)
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("APPROVED", result.stdout)
+
+    def test_min_reviewers_reprova(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof,review")
+            config_path = repo / "atesto.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["min_reviewers"] = 2
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            proof(repo)
+            commit(repo)
+            cli(
+                repo,
+                "review",
+                "demo",
+                "--head",
+                "HEAD",
+                "--verdict",
+                "APPROVED",
+                "--reviewer",
+                "one",
+            )
+            commit(repo)
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("pelo menos 2", result.stdout)
+
+    def test_min_reviewers_duplicados_reprova(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof,review")
+            config_path = repo / "atesto.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["min_reviewers"] = 2
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            proof(repo)
+            commit(repo)
+            cli(
+                repo,
+                "review",
+                "demo",
+                "--head",
+                "HEAD",
+                "--verdict",
+                "APPROVED",
+                "--reviewer",
+                "alice",
+            )
+            review_path = repo / "docs" / "atesto" / "demo" / "review.json"
+            data = json.loads(review_path.read_text(encoding="utf-8"))
+            data["reviewers"] = ["alice", "alice"]
+            review_path.write_text(json.dumps(data), encoding="utf-8")
+            commit(repo, "duplicate reviewers")
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("unicos", result.stdout)
+
+    def test_schema_bool_reprova(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            proof(repo)
+            proof_path = repo / "docs" / "atesto" / "demo" / "proof.json"
+            data = json.loads(proof_path.read_text(encoding="utf-8"))
+            data["schema"] = True
+            proof_path.write_text(json.dumps(data), encoding="utf-8")
+            commit(repo)
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("schema", result.stdout)
+
+    def test_output_path_traversal_reprova(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            proof(repo)
+            proof_path = repo / "docs" / "atesto" / "demo" / "proof.json"
+            data = json.loads(proof_path.read_text(encoding="utf-8"))
+            data["output"]["path"] = "../../outside.txt"
+            proof_path.write_text(json.dumps(data), encoding="utf-8")
+            commit(repo)
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("output.path", result.stdout)
+
+    def test_proof_symlink_reprova(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            proof(repo)
+            commit(repo)
+            directory = repo / "docs" / "atesto" / "demo"
+            original = Path(tmp) / "outside-proof.json"
+            original.write_bytes((directory / "proof.json").read_bytes())
+            (directory / "proof.json").unlink()
+            (directory / "proof.json").symlink_to(original)
+            commit(repo, "symlink proof")
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("proof.json", result.stdout)
+
+    def test_exec_mode_change_reprova(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            proof(repo)
+            commit(repo)
+            (repo / "app.py").chmod(0o755)
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("stale", result.stdout)
+
+    def test_review_stale_specific(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof,review")
+            proof(repo)
+            commit(repo)
+            cli(
+                repo,
+                "review",
+                "demo",
+                "--head",
+                "HEAD",
+                "--verdict",
+                "APPROVED",
+                "--reviewer",
+                "reviewer",
+            )
+            commit(repo)
+            (repo / "app.py").write_text("x = 9\n", encoding="utf-8")
+            commit(repo, "code")
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("review stale", result.stdout + result.stderr)
+
+    def test_dirty_proof_then_edit_reprova(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            (repo / "app.py").write_text("x = 3\n", encoding="utf-8")
+            proof(repo)
+            self.assertEqual(cli(repo, "check").returncode, 0)
+            (repo / "app.py").write_text("x = 4\n", encoding="utf-8")
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("stale", result.stdout)
+
+    def test_pstack_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            (repo / "atesto.json").rename(repo / "pstack.json")
+            proof(repo)
+            commit(repo)
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_crlf_dirty_proof_stable_after_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            git(repo, "config", "core.autocrlf", "true")
+            init(repo)
+            (repo / "app.py").write_bytes(b"x = 1\r\ny = 2\r\n")
+            proof(repo)
+            commit(repo)
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_sha256_repo_stable_after_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            result = subprocess.run(
+                ["git", "init", "--object-format=sha256", "-q"],
+                cwd=repo,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                self.skipTest("git sem suporte a sha256")
+            git(repo, "config", "user.email", "atesto@example.com")
+            git(repo, "config", "user.name", "Atesto")
+            git(repo, "config", "commit.gpgsign", "false")
+            (repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+            git(repo, "add", "app.py")
+            git(repo, "commit", "-qm", "base")
+            init(repo)
+            proof(repo)
+            commit(repo)
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_artifacts_root_normalizado(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            result = cli(
+                repo, "init", "--artifacts-root", "./evidence"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            proof(repo)
+            commit(repo)
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_require_review_sem_proof_reprova(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            result = cli(repo, "init", "--require", "review")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("incluir proof", result.stderr)
+
+    def test_check_slug_absoluto_reprova(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            proof(repo)
+            commit(repo)
+            result = cli(repo, "check", "--slug", "/tmp/outside")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("slug invalido", result.stderr)
+
+    def test_excludes_normalizado(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            config_path = repo / "atesto.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["fingerprint_excludes"] = ["./vendor"]
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            (repo / "vendor").mkdir()
+            (repo / "vendor" / "lib.py").write_text("v = 1\n", encoding="utf-8")
+            commit(repo, "vendor")
+            proof(repo)
+            commit(repo, "evidence")
+            (repo / "vendor" / "lib.py").write_text("v = 2\n", encoding="utf-8")
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_require_sem_proof_reprova(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            result = cli(repo, "init", "--require", "")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("incluir proof", result.stderr)
+
+    def test_no_output_nao_captura(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            result = cli(
+                repo,
+                "proof",
+                "--no-output",
+                "demo",
+                "--",
+                sys.executable,
+                "-c",
+                "print('secret')",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            commit(repo)
+            output = repo / "docs" / "atesto" / "demo" / "proof-output.txt"
+            self.assertEqual(output.read_bytes(), b"")
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_check_json_gate_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            result = cli(repo, "check", "--json")
+            self.assertEqual(result.returncode, 1)
+            data = json.loads(result.stdout)
+            self.assertFalse(data["ok"])
+            self.assertTrue(data["problems"])
+
+    def test_check_em_subdir_reprova(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            (repo / "pkg").mkdir()
+            result = cli(repo, "check", "--root", "pkg")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("raiz do repo", result.stderr)
+
+    def test_init_em_subdir_reprova(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            (repo / "pkg").mkdir()
+            result = cli(repo, "init", "--root", "pkg")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("raiz do repo", result.stderr)
+
+    def test_hook_install_status_uninstall(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            result = cli(repo, "hooks", "install")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            hook = repo / ".git" / "hooks" / "pre-push"
+            self.assertTrue(hook.is_file())
+            self.assertIn("atesto pre-push hook", hook.read_text(encoding="utf-8"))
+            self.assertTrue(os.access(hook, os.X_OK))
+            self.assertEqual(cli(repo, "hooks", "status").returncode, 0)
+            result = cli(repo, "hooks", "uninstall")
+            self.assertEqual(result.returncode, 0)
+            self.assertFalse(hook.exists())
+
+    def test_hook_respeita_core_hooks_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            git(repo, "config", "core.hooksPath", ".githooks")
+            result = cli(repo, "hooks", "install")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(
+                (repo / ".githooks" / "pre-push").is_file()
+            )
+            self.assertFalse(
+                (repo / ".git" / "hooks" / "pre-push").exists()
+            )
+
+    def test_test_cmd_alterando_arvore_reprova(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, test_cmd="printf 'x = 666\\n' > app.py")
+            proof(repo)
+            commit(repo)
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("test_cmd alterou", result.stdout)
+
+    def test_symlink_para_diretorio_reprova(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            (repo / "d1").mkdir()
+            (repo / "d2").mkdir()
+            (repo / "link").symlink_to("d1")
+            commit(repo, "link")
+            init(repo)
+            proof(repo)
+            commit(repo, "evidence")
+            (repo / "link").unlink()
+            (repo / "link").symlink_to("d2")
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("stale", result.stdout)
+
+    def test_test_cmd_cache_untracked_passa(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(
+                repo,
+                test_cmd="mkdir -p __pycache__ && echo x > __pycache__/x",
+            )
+            proof(repo)
+            commit(repo)
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_dois_artefatos_escolhe_com_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof,review")
+            cli(
+                repo, "proof", "alpha", "--",
+                sys.executable, "-c", "print('alpha')",
+            )
+            commit(repo, "alpha")
+            cli(
+                repo, "review", "alpha", "--head", "HEAD",
+                "--verdict", "APPROVED", "--reviewer", "reviewer",
+            )
+            commit(repo, "alpha review")
+            cli(
+                repo, "proof", "beta", "--",
+                sys.executable, "-c", "print('beta')",
+            )
+            commit(repo, "beta")
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_submodule_sujo_reprova(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            child = base / "child"
+            child.mkdir()
+            git(child, "init", "-q")
+            git(child, "config", "user.email", "atesto@example.com")
+            git(child, "config", "user.name", "Atesto")
+            git(child, "config", "commit.gpgsign", "false")
+            (child / "lib.py").write_text("x = 1\n", encoding="utf-8")
+            git(child, "add", ".")
+            git(child, "commit", "-qm", "child")
+            repo = make_repo(tmp)
+            result = subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "add",
+                    str(child),
+                    "sub",
+                ],
+                cwd=repo,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            git(repo, "add", ".")
+            git(repo, "commit", "-qm", "submodule")
+            init(repo)
+            proof(repo)
+            commit(repo, "evidence")
+            (repo / "sub" / "lib.py").write_text("x = 2\n", encoding="utf-8")
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("stale", result.stdout)
+
+    def test_hook_bloqueia_arvore_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            proof(repo)
+            commit(repo)
+            self.assertEqual(cli(repo, "hooks", "install").returncode, 0)
+            shim_dir = repo / ".test-bin"
+            shim_dir.mkdir()
+            shim = shim_dir / "atesto"
+            shim.write_text(
+                "#!/bin/sh\n"
+                f"exec {shlex.quote(sys.executable)} -m atesto \"$@\"\n",
+                encoding="utf-8",
+            )
+            shim.chmod(0o755)
+            (repo / "app.py").write_text("x = 99\n", encoding="utf-8")
+            env = {
+                **os.environ,
+                "PATH": str(shim_dir) + os.pathsep + os.environ["PATH"],
+                "PYTHONPATH": str(SRC),
+            }
+            hook = repo / ".git" / "hooks" / "pre-push"
+            result = subprocess.run(
+                [str(hook)],
+                cwd=repo,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_slug_path_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            result = cli(repo, "proof", "../x", "--", "true")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("slug invalido", result.stderr)
+
+    def test_init_does_not_create_ci(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            self.assertFalse((repo / ".github").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

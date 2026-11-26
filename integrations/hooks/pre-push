@@ -1,0 +1,3 @@
+#!/bin/sh
+# atesto pre-push hook
+exec python3 -m atesto check --local || exit 1

@@ -1,0 +1,45 @@
+# Atesto gate — optional, additive CI workflow.
+#
+# Do NOT edit an existing CI workflow to add this. Add this file as a new
+# workflow, or run `atesto check` locally. The workflow is not required by
+# default; branch protection/rulesets decide that.
+#
+# Pin the Atesto version below and keep it in sync with the version used to
+# produce the proof. The version is published on PyPI only after the v0
+# release; while unpublished, install from a pinned commit or from a local
+# checkout. For stronger anti-tamper, keep this workflow and `atesto.json` in
+# CODEOWNERS and materialize the checker from the base branch.
+name: atesto gate
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: atesto-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Atesto
+        env:
+          ATESTO_VERSION: "0.1.0"
+        run: pip install "atesto==$ATESTO_VERSION"
+      - name: Atesto gate
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+        run: |
+          atesto check --ci --base "$BASE_REF"

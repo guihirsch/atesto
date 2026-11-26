@@ -1,0 +1,8 @@
+Atesto
+Copyright 2026 Atesto contributors
+
+This product includes ideas and terminology from the pstack line of work by
+Lauren Tan (poteto) and contributors. Atesto is an independent implementation
+focused on evidence validation; it does not include pstack source code.
+
+Licensed under the Apache License, Version 2.0.
