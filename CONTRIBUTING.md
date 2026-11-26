@@ -16,3 +16,12 @@ ruff check .
   core. Adapters live under `integrations/` and are optional.
 - License: Apache-2.0. By contributing you agree to license your contribution
   under the same terms.
+
+## Issues and labels
+
+Work is tracked in GitHub Issues. Triage uses five labels: `needs-triage`,
+`needs-info`, `ready-for-agent`, `ready-for-human` and `wontfix`.
+
+The conventions agents follow in this repo — tracker operations, label
+vocabulary and domain docs — live under `docs/agents/`, with entry points in
+`AGENTS.md`.
