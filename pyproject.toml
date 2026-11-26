@@ -1,10 +1,13 @@
 [build-system]
-requires = ["setuptools>=68"]
+# Exact pin: the release wheel hash in
+# integrations/github-actions/atesto-gate.yml is reproducible only with this
+# backend. Update the pin and the template hash together.
+requires = ["setuptools==84.2.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "atesto"
-version = "0.1.1"
+version = "0.2.0"
 description = "Evidence gate for AI-written code: proof and review at the code head."
 readme = "README.md"
 requires-python = ">=3.10"

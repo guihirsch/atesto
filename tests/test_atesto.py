@@ -1886,5 +1886,58 @@ class ConfigSchemaTest(unittest.TestCase):
         self.assertIn("src/atesto/schemas/atesto.schema.json", readme)
 
 
+class ReleaseMetadataTest(unittest.TestCase):
+    """Release artifacts must stay consistent with the packaged version."""
+
+    def test_ci_template_pins_current_release_with_hash(self) -> None:
+        template = (
+            ROOT / "integrations" / "github-actions" / "atesto-gate.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(f"atesto=={package_version()}", template)
+        hashes = re.findall(r"--hash=sha256:([0-9a-f]{64})", template)
+        self.assertEqual(len(hashes), 1, template)
+        self.assertNotIn("0" * 64, hashes[0])
+        self.assertIn("--require-hashes", template)
+        self.assertIn("--no-deps", template)
+        self.assertIn('python-version: "3.12"', template)
+        smoke = template.index("atesto --version")
+        gate = template.index("atesto check --ci")
+        self.assertLess(smoke, gate)
+
+    def test_release_build_pins_inputs_and_timestamp(self) -> None:
+        workflow = (
+            ROOT / ".github" / "workflows" / "release.yml"
+        ).read_text(encoding="utf-8")
+        self.assertRegex(workflow, r'SOURCE_DATE_EPOCH:\s*"[0-9]{9,10}"')
+        self.assertIn("python -m build", workflow)
+        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertRegex(
+            pyproject,
+            r'\[build-system\][\s\S]*?"setuptools==[0-9][^"]*"',
+        )
+
+    def test_changelog_documents_breaking_release(self) -> None:
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        marker = f"## [{package_version()}]"
+        self.assertIn(marker, changelog)
+        entry = changelog.split(marker, 1)[1].split("\n## [", 1)[0]
+        self.assertRegex(entry, r"(?i)breaking")
+        self.assertIn("desconhecid", entry)
+        self.assertIn("adaptador", entry)
+
+    def test_readme_documents_v2_contract(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn('"version": 2', readme)
+        for term in (
+            "test_timeout_seconds",
+            "doctor",
+            "tool",
+            "adapter",
+            "unknown",
+        ):
+            with self.subTest(term=term):
+                self.assertIn(term, readme)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -18,9 +18,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # Reproducible wheel: setuptools is pinned in pyproject.toml and the
+      # timestamp is fixed, so the sha256 in
+      # integrations/github-actions/atesto-gate.yml can be reproduced from
+      # this tree. Rebuild with these settings and compare before changing
+      # either value.
       - name: Build sdist and wheel
+        env:
+          SOURCE_DATE_EPOCH: "1795651200"
         run: |
-          python -m pip install build
+          python -m pip install "build==1.6.1"
           python -m build
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

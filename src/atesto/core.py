@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.1.1"
+VERSION = "0.2.0"
 TOOL_NAME = "atesto"
 CONFIG_NAMES = ("atesto.json", "pstack.json")
 DEFAULT_ARTIFACTS_ROOT = "docs/atesto"
