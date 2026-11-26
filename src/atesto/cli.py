@@ -173,32 +173,59 @@ def _run_check(args: argparse.Namespace) -> int:
 
 def _run_doctor(args: argparse.Namespace) -> int:
     root = _root(args.root)
-    issues: list[str] = []
-    try:
-        head = core.git_head(root)
+    report = core.doctor_report(root)
+    head = report["head"]
+    if head:
         print(f"git: ok ({head[:12]})")
-    except core.AtestoError as exc:
-        issues.append(str(exc))
-        print(f"git: FAIL ({exc})")
-    try:
-        config = core.load_config(root)
-        name = (
-            config.path.name
-            if config.path is not None and config.path.is_file()
-            else "default"
-        )
+    else:
+        print("git: FAIL")
+    suffix = "" if report["config_valid"] else " (INVALIDA)"
+    print(f"config: {report['config_name']}{suffix}")
+    version = report["config_version"]
+    if version is None:
+        print("version: desconhecida")
+    else:
+        print(f"version: {version}")
+    if report["unknown_keys"]:
         print(
-            f"config: {name} "
-            f"(require={','.join(config.require)}, root={config.artifacts_root})"
+            "unknown keys (desconhecidas): "
+            + ", ".join(report["unknown_keys"])
         )
-        base = core._safe_artifacts_root(root, config.artifacts_root)
-        print(f"artefatos: {'ok' if base.is_dir() else 'ausente'} ({base})")
-    except core.AtestoError as exc:
-        issues.append(str(exc))
-        print(f"config: FAIL ({exc})")
-    print(f"hook: {core.hook_status(root)}")
-    print(f"versao: {core.VERSION}")
-    return 1 if issues else 0
+    print(f"require: {','.join(report['require'])}")
+    print(f"min_reviewers: {report['min_reviewers']}")
+    print(f"artifacts_root: {report['artifacts_root']}")
+    timeout = report["test_timeout_seconds"]
+    print(f"timeout: {timeout}s" if timeout is not None else "timeout: nenhum")
+    print(f"hook: {report['hook']}")
+    print(f"versao: {report['version']}")
+    print(
+        f"artefatos: {report['artifacts_state']} "
+        f"({report['artifacts_root']})"
+    )
+    for entry in report["artifacts"]:
+        if entry["proof"] == "ausente":
+            print(f"artefato {entry['slug']}: proof ausente")
+        else:
+            print(
+                f"artefato {entry['slug']}: proof {entry['proof']} "
+                f"(tool={entry['proof_tool']})"
+            )
+        if entry["review"] == "ausente":
+            if entry["proof"] != "ausente" and "review" in report["require"]:
+                print(
+                    f"artefato {entry['slug']}: review ausente (exigida)"
+                )
+        else:
+            print(
+                f"artefato {entry['slug']}: review {entry['review']} "
+                f"(tool={entry['review_tool']})"
+            )
+    if report["issues"]:
+        for issue in report["issues"]:
+            print(f"FAIL  {issue}")
+    else:
+        print("atesto: ok")
+    return 0 if report["ok"] else 1
 
 
 def _run_fingerprint(args: argparse.Namespace) -> int:
