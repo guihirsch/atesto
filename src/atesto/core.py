@@ -13,10 +13,12 @@ import os
 import posixpath
 import re
 import shlex
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -30,6 +32,8 @@ DEFAULT_ARTIFACTS_ROOT = "docs/atesto"
 PROOF_SCHEMA = 1
 REVIEW_SCHEMA = 1
 MAX_OUTPUT_BYTES = 2_000_000
+TEST_OUTPUT_TAIL = 4000
+TERMINATION_GRACE_SECONDS = 0.5
 VALID_REQUIREMENTS = {"proof", "review"}
 VALID_VERDICTS = {"APPROVED", "CHANGES_REQUESTED"}
 
@@ -48,7 +52,11 @@ CONFIG_KEYS_V1 = frozenset(
         "excludes",
     }
 )
-CONFIG_KEYS_BY_VERSION: dict[int, frozenset[str]] = {1: CONFIG_KEYS_V1}
+CONFIG_KEYS_V2 = CONFIG_KEYS_V1 | {"test_timeout_seconds"}
+CONFIG_KEYS_BY_VERSION: dict[int, frozenset[str]] = {
+    1: CONFIG_KEYS_V1,
+    2: CONFIG_KEYS_V2,
+}
 
 
 class AtestoError(Exception):
@@ -228,11 +236,12 @@ def ensure_dir(root: Path, path: Path) -> None:
 
 @dataclass
 class Config:
-    version: int = 1
+    version: int = 2
     artifacts_root: str = DEFAULT_ARTIFACTS_ROOT
     require: list[str] = field(default_factory=lambda: ["proof"])
     min_reviewers: int = 1
     test_cmd: str = ""
+    test_timeout_seconds: int | None = None
     review_artifacts_paths: list[str] = field(default_factory=list)
     excludes: list[str] = field(default_factory=list)
     path: Path | None = None
@@ -289,6 +298,17 @@ class Config:
         test_cmd = data.get("test_cmd", "")
         if not isinstance(test_cmd, str):
             raise AtestoError(f"{path.name} test_cmd precisa ser string")
+        if "test_timeout_seconds" in data:
+            test_timeout_seconds = data["test_timeout_seconds"]
+            if (
+                type(test_timeout_seconds) is not int
+                or test_timeout_seconds < 1
+            ):
+                raise AtestoError(
+                    f"{path.name} test_timeout_seconds precisa ser inteiro >= 1"
+                )
+        else:
+            test_timeout_seconds = None
         review_paths = data.get(
             "review_artifacts_paths", [artifacts_root]
         )
@@ -316,11 +336,12 @@ class Config:
         if "proof" not in require:
             raise AtestoError(f"{path.name} require precisa incluir proof")
         config = cls(
-            version=1,
+            version=version,
             artifacts_root=artifacts_root.strip(),
             require=list(dict.fromkeys(require)),
             min_reviewers=min_reviewers,
             test_cmd=test_cmd.strip(),
+            test_timeout_seconds=test_timeout_seconds,
             review_artifacts_paths=[item.strip() for item in review_paths],
             excludes=[item.strip() for item in excludes],
             path=path,
@@ -778,6 +799,98 @@ def _find_artifact_dir(
     )
 
 
+def _process_group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _terminate_test_process(process: subprocess.Popen[str]) -> None:
+    """Encerra o test_cmd e seus descendentes.
+
+    Em POSIX o comando roda em uma sessao propria; SIGTERM e enviado ao grupo,
+    seguido de SIGKILL depois de uma graca curta. Em plataformas sem grupos de
+    processo apenas o filho direto e encerrado (limitacao conhecida).
+    """
+    if os.name != "posix":
+        process.terminate()
+        try:
+            process.wait(timeout=TERMINATION_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        return
+    pgid = process.pid
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + TERMINATION_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        process.poll()
+        if not _process_group_alive(pgid):
+            return
+        time.sleep(0.05)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _run_test_cmd(
+    root: Path,
+    command: str,
+    timeout_seconds: int | None,
+) -> tuple[int, str, bool]:
+    """Executa test_cmd; retorna (exit, output, timed_out).
+
+    Sem timeout, preserva o comportamento anterior (subprocess.run). Com
+    timeout, roda em um grupo de processos proprio para que o limite valha
+    para o comando e seus descendentes.
+    """
+    if timeout_seconds is None:
+        result = subprocess.run(
+            command,
+            cwd=root,
+            shell=True,
+            capture_output=True,
+            text=True,
+            errors="surrogateescape",
+            check=False,
+        )
+        output = (result.stdout + result.stderr)[-TEST_OUTPUT_TAIL:]
+        return result.returncode, output, False
+    session: dict[str, bool] = {}
+    if os.name == "posix":
+        session["start_new_session"] = True
+    process = subprocess.Popen(
+        command,
+        cwd=root,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="surrogateescape",
+        **session,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        _terminate_test_process(process)
+        stdout, stderr = process.communicate()
+        exit_code = (
+            process.returncode
+            if process.returncode is not None
+            else -signal.SIGKILL
+        )
+        return exit_code, (stdout + stderr)[-TEST_OUTPUT_TAIL:], True
+    return process.returncode, (stdout + stderr)[-TEST_OUTPUT_TAIL:], False
+
+
 def check(
     root: Path,
     *,
@@ -836,6 +949,22 @@ def check(
             head_config = Config.from_data(head_data, root / head_name, root)
         except AtestoError as exc:
             raise GateError(f"config do HEAD invalida: {exc}") from exc
+        if head_config.version < config.version:
+            raise GateError(
+                "config do HEAD faz downgrade de version da base "
+                f"({head_config.version} < {config.version})"
+            )
+        base_timeout = config.test_timeout_seconds
+        head_timeout = head_config.test_timeout_seconds
+        if base_timeout is not None:
+            if head_timeout is None:
+                raise GateError(
+                    "config do HEAD remove test_timeout_seconds da base"
+                )
+            if head_timeout > base_timeout:
+                raise GateError(
+                    "config do HEAD aumenta test_timeout_seconds da base"
+                )
         missing = set(config.require) - set(head_config.require)
         if missing:
             raise GateError(
@@ -865,11 +994,14 @@ def check(
         # arvore efetivamente provada; usar a base para o fingerprint faria
         # uma prova valida do HEAD parecer stale.
         config = Config(
-            version=1,
+            version=head_config.version,
             artifacts_root=head_config.artifacts_root,
             require=list(config.require),
             min_reviewers=config.min_reviewers,
             test_cmd=config.test_cmd,
+            test_timeout_seconds=(
+                head_timeout if head_timeout is not None else base_timeout
+            ),
             review_artifacts_paths=list(head_config.review_artifacts_paths),
             excludes=list(head_config.excludes),
             path=head_config.path,
@@ -900,25 +1032,23 @@ def check(
 
     test_exit: int | None = None
     test_output = ""
+    timed_out = False
     if config.test_cmd and run_test and not problems:
         before_test = git(
             root,
             ["status", "--porcelain=v1", "--untracked-files=no"],
             check=False,
         )
-        result = subprocess.run(
-            config.test_cmd,
-            cwd=root,
-            shell=True,
-            capture_output=True,
-            text=True,
-            errors="surrogateescape",
-            check=False,
+        test_exit, test_output, timed_out = _run_test_cmd(
+            root, config.test_cmd, config.test_timeout_seconds
         )
-        test_exit = result.returncode
-        test_output = (result.stdout + result.stderr)[-4000:]
-        if result.returncode != 0:
-            problems.append(f"test_cmd falhou (exit {result.returncode})")
+        if timed_out:
+            problems.append(
+                f"test_cmd excedeu o timeout de "
+                f"{config.test_timeout_seconds}s: {config.test_cmd}"
+            )
+        elif test_exit != 0:
+            problems.append(f"test_cmd falhou (exit {test_exit})")
         after_test = git(
             root,
             ["status", "--porcelain=v1", "--untracked-files=no"],
@@ -941,6 +1071,8 @@ def check(
         "review": review,
         "test_exit": test_exit,
         "test_output": test_output,
+        "test_timeout_seconds": config.test_timeout_seconds,
+        "timed_out": timed_out,
         "tree_sha256": current["tree_sha256"],
         "dirty": current["dirty"],
         "dirty_paths": current["dirty_paths"],
@@ -1069,7 +1201,7 @@ def init_config(
         raise AtestoError("require precisa incluir proof")
     artifacts_root = normalize_rel_path(artifacts_root, "artifacts_root")
     data = {
-        "version": 1,
+        "version": 2,
         "artifacts_root": artifacts_root,
         "require": require,
         "min_reviewers": 1,
