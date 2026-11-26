@@ -44,8 +44,9 @@
 - Wheel reproduzível: `SOURCE_DATE_EPOCH` fixo e ambiente de build do release
   pinado no workflow (`build==1.6.1`, `setuptools==84.2.1`, `wheel==0.48.0`,
   `python -m build --no-isolation`); `[build-system]` segue permissivo
-  (`setuptools>=69`) para builds a partir do fonte. O hash do wheel no
-  template é verificado por build duplo.
+  (`setuptools>=69`) para builds a partir do fonte. O hash do template é o
+  sha256 do wheel publicado; rebuilds locais exigem checkout limpo com
+  `umask 022` (permissões de arquivo entram no zip).
 - 113 testes.
 
 ## [0.1.1] - 2026-11-26

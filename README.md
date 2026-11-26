@@ -208,10 +208,9 @@ recorded, so keep secrets out of arguments too).
   consistent and current.
 - A dirty submodule is bound by its HEAD, status and tracked diff. Content of
   untracked files inside the submodule is still not hashed.
-- The CI template pins the published 0.2.0 wheel by sha256. Until 0.2.0 is on
-  PyPI, install from a pinned commit or a local checkout instead. Keep the
-  workflow and `atesto.json` in CODEOWNERS; a PR that can edit the workflow
-  can replace the gate.
+- The CI template pins the published 0.2.0 wheel by sha256. Keep the workflow
+  and `atesto.json` in CODEOWNERS; a PR that can edit the workflow can replace
+  the gate.
 - `--ci` does not allow a PR to change `test_cmd`, `artifacts_root`,
   `min_reviewers` downward, remove or raise a base timeout, downgrade the
   config version, or add excludes/review paths. Fixing those requires a
@@ -227,14 +226,17 @@ The 0.2.0 wheel is built reproducibly so the CI template can pin a real hash:
   (`build==1.6.1`, `setuptools==84.2.1`, `wheel==0.48.0`), runs
   `python -m build --no-isolation`, and sets `SOURCE_DATE_EPOCH=1795651200`
   (2026-11-26T00:00:00Z);
-- rebuilding `atesto-0.2.0-py3-none-any.whl` from the same tree with those
-  settings must produce the sha256 in
-  `integrations/github-actions/atesto-gate.yml`.
+- a clean checkout built with `umask 022` reproduces
+  `atesto-0.2.0-py3-none-any.whl` byte for byte. File permissions are stored
+  in the wheel zip, so a group-writable checkout (for example `umask 002`)
+  changes the hash;
+- the template pins the published wheel:
+  `sha256:b4e5d9c14156986d80aaa1355cb5221fcc6237ceb2d0d71e1f33146196e07e3b`.
 
-After a release, recompute with
-`sha256sum dist/atesto-0.2.0-py3-none-any.whl`. If the pinned build
-environment or the fixed timestamp changes, update the template hash in the
-same change.
+After a release, verify the published artifact directly from PyPI (or from
+the uploaded wheel) instead of trusting a local rebuild. If the pinned build
+environment or timestamp changes, update the template hash in the same
+change.
 
 ## Development
 
