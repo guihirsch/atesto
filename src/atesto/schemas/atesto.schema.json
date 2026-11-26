@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atesto.dev/schemas/atesto.schema.json",
+  "title": "Atesto config",
+  "description": "Strict schema for atesto.json (and the pstack.json fallback). The loader remains the source of truth; unknown top-level keys are rejected for every version.",
+  "oneOf": [
+    { "$ref": "#/$defs/v1" },
+    { "$ref": "#/$defs/v2" }
+  ],
+  "$defs": {
+    "v1": {
+      "title": "Atesto config v1",
+      "type": "object",
+      "properties": {
+        "version": {
+          "type": "integer",
+          "const": 1,
+          "default": 1,
+          "description": "Config version; omitted means 1."
+        },
+        "artifacts_root": {
+          "type": "string",
+          "minLength": 1,
+          "default": "docs/atesto"
+        },
+        "require": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["proof", "review"] },
+          "contains": { "const": "proof" },
+          "default": ["proof"]
+        },
+        "min_reviewers": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1
+        },
+        "test_cmd": {
+          "type": "string",
+          "default": ""
+        },
+        "review_artifacts_paths": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "fingerprint_excludes": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "default": []
+        },
+        "excludes": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "default": []
+        }
+      },
+      "additionalProperties": false
+    },
+    "v2": {
+      "title": "Atesto config v2",
+      "type": "object",
+      "required": ["version"],
+      "properties": {
+        "version": {
+          "type": "integer",
+          "const": 2,
+          "description": "Config version; v2 requires the new keys to be declared explicitly."
+        },
+        "artifacts_root": {
+          "type": "string",
+          "minLength": 1,
+          "default": "docs/atesto"
+        },
+        "require": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["proof", "review"] },
+          "contains": { "const": "proof" },
+          "default": ["proof"]
+        },
+        "min_reviewers": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1
+        },
+        "test_cmd": {
+          "type": "string",
+          "default": ""
+        },
+        "test_timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Seconds before test_cmd fails closed; absent means no timeout."
+        },
+        "review_artifacts_paths": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "fingerprint_excludes": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "default": []
+        },
+        "excludes": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "default": []
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

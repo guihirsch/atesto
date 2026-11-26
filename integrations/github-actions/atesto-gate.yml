@@ -4,11 +4,17 @@
 # workflow, or run `atesto check` locally. The workflow is not required by
 # default; branch protection/rulesets decide that.
 #
-# Pin the Atesto version below and keep it in sync with the version used to
-# produce the proof. The version is published on PyPI only after the v0
-# release; while unpublished, install from a pinned commit or from a local
-# checkout. For stronger anti-tamper, keep this workflow and `atesto.json` in
-# CODEOWNERS and materialize the checker from the base branch.
+# The install is hash-pinned to the 0.2.0 wheel. Keep this workflow and
+# `atesto.json` in CODEOWNERS; for stronger anti-tamper, materialize the
+# checker from the base branch. Until 0.2.0 is published on PyPI, install from
+# a pinned commit or a local checkout instead.
+#
+# Self-hosted runners: use a clean runner (or container) with a fresh Python
+# 3.12 and no preinstalled `atesto`/`build` packages in its site-packages. A
+# runner image or PATH that provides another atesto can silently replace the
+# hash-pinned wheel; the `atesto --version` smoke step below only catches a
+# different version, not a malicious same-version binary. Do not run this gate
+# on runners untrusted pull requests can modify.
 name: atesto gate
 
 on:
@@ -35,9 +41,16 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install Atesto
-        env:
-          ATESTO_VERSION: "0.1.0"
-        run: pip install "atesto==$ATESTO_VERSION"
+        run: |
+          cat > "$RUNNER_TEMP/atesto-requirements.txt" <<'REQ'
+          atesto==0.2.0 --hash=sha256:765a3956723f3e6237f40cf547ffa42539dd7bafc3c0f24edf6be465e46ac72c
+          REQ
+          python -m pip install --require-hashes --no-deps \
+            -r "$RUNNER_TEMP/atesto-requirements.txt"
+      - name: Atesto version smoke test
+        run: |
+          atesto --version
+          test "$(atesto --version)" = "atesto 0.2.0"
       - name: Atesto gate
         env:
           BASE_REF: origin/${{ github.base_ref }}

@@ -1,10 +1,14 @@
 [build-system]
-requires = ["setuptools>=68"]
+# Permissive on purpose: source builds should not require the exact release
+# backend. The reproducible wheel hash in
+# integrations/github-actions/atesto-gate.yml is pinned by the build
+# environment in .github/workflows/release.yml, not by this source tree.
+requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "atesto"
-version = "0.1.1"
+version = "0.2.0"
 description = "Evidence gate for AI-written code: proof and review at the code head."
 readme = "README.md"
 requires-python = ">=3.10"
