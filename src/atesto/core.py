@@ -234,6 +234,17 @@ def ensure_dir(root: Path, path: Path) -> None:
         current.mkdir(exist_ok=True)
 
 
+def config_path(root: Path) -> Path | None:
+    """Retorna o arquivo de config escolhido, sem le-lo."""
+    for name in CONFIG_NAMES:
+        candidate = root / name
+        if candidate.is_symlink():
+            raise AtestoError(f"{name} nao pode ser symlink")
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 @dataclass
 class Config:
     version: int = 2
@@ -351,14 +362,7 @@ class Config:
 
     @classmethod
     def load(cls, root: Path) -> Config:
-        chosen: Path | None = None
-        for name in CONFIG_NAMES:
-            candidate = root / name
-            if candidate.is_symlink():
-                raise AtestoError(f"{name} nao pode ser symlink")
-            if candidate.is_file():
-                chosen = candidate
-                break
+        chosen = config_path(root)
         if chosen is None:
             config = cls(path=root / "atesto.json")
             config.review_artifacts_paths = [config.artifacts_root]
@@ -1280,3 +1284,323 @@ def hook_status(root: Path) -> str:
         return "ausente"
     text = path.read_text(encoding="utf-8", errors="replace")
     return "instalado" if HOOK_MARKER in text else "outro"
+
+
+def _doctor_fallback_config(data: dict[str, Any], path: Path | None) -> Config:
+    """Config tolerante para diagnostico quando a validacao estrita falha.
+
+    Serve apenas para localizar artefatos e mostrar valores efetivos; nao
+    substitui a validacao de `Config.from_data`.
+    """
+    raw_root = data.get("artifacts_root", DEFAULT_ARTIFACTS_ROOT)
+    if not isinstance(raw_root, str) or not raw_root.strip():
+        artifacts_root = DEFAULT_ARTIFACTS_ROOT
+    else:
+        try:
+            artifacts_root = normalize_rel_path(raw_root, "artifacts_root")
+        except AtestoError:
+            artifacts_root = DEFAULT_ARTIFACTS_ROOT
+    require = data.get("require", ["proof"])
+    if (
+        not isinstance(require, list)
+        or not require
+        or not all(isinstance(item, str) for item in require)
+        or "proof" not in require
+        or set(require) - VALID_REQUIREMENTS
+    ):
+        require = ["proof"]
+    else:
+        require = list(dict.fromkeys(require))
+    min_reviewers = data.get("min_reviewers", 1)
+    if type(min_reviewers) is not int or min_reviewers < 1:
+        min_reviewers = 1
+    test_cmd = data.get("test_cmd", "")
+    if not isinstance(test_cmd, str):
+        test_cmd = ""
+    test_timeout_seconds = data.get("test_timeout_seconds")
+    if type(test_timeout_seconds) is not int or test_timeout_seconds < 1:
+        test_timeout_seconds = None
+    review_paths = data.get("review_artifacts_paths", [artifacts_root])
+    if not isinstance(review_paths, list) or not all(
+        isinstance(item, str) and item.strip() for item in review_paths
+    ):
+        review_paths = [artifacts_root]
+    else:
+        cleaned: list[str] = []
+        for item in review_paths:
+            try:
+                cleaned.append(
+                    normalize_rel_path(item, "review_artifacts_paths")
+                )
+            except AtestoError:
+                continue
+        review_paths = cleaned or [artifacts_root]
+    excludes = data.get("fingerprint_excludes", data.get("excludes", []))
+    if not isinstance(excludes, list) or not all(
+        isinstance(item, str) and item.strip() for item in excludes
+    ):
+        excludes = []
+    else:
+        cleaned = []
+        for item in excludes:
+            try:
+                cleaned.append(normalize_rel_path(item, "excludes"))
+            except AtestoError:
+                continue
+        excludes = cleaned
+    version = data.get("version", 2)
+    if type(version) is not int or version not in CONFIG_KEYS_BY_VERSION:
+        version = max(CONFIG_KEYS_BY_VERSION)
+    return Config(
+        version=version,
+        artifacts_root=artifacts_root,
+        require=require,
+        min_reviewers=min_reviewers,
+        test_cmd=test_cmd.strip(),
+        test_timeout_seconds=test_timeout_seconds,
+        review_artifacts_paths=[item.strip() for item in review_paths],
+        excludes=[item.strip() for item in excludes],
+        path=path,
+    )
+
+
+def _doctor_tool(data: dict[str, Any] | None) -> str:
+    if not isinstance(data, dict) or "tool" not in data:
+        return "ausente"
+    tool = data["tool"]
+    if not isinstance(tool, dict):
+        return "invalido"
+    name = tool.get("name")
+    version = tool.get("version")
+    if (
+        not isinstance(name, str)
+        or not name.strip()
+        or not isinstance(version, str)
+        or not version.strip()
+    ):
+        return "invalido"
+    return f"{name.strip()} {version.strip()}"
+
+
+def _doctor_artifacts(
+    root: Path, config: Config
+) -> tuple[list[dict[str, Any]], list[str], str]:
+    """Inspeciona os artefatos sem escrever e sem abortar no primeiro erro."""
+    entries: list[dict[str, Any]] = []
+    issues: list[str] = []
+    try:
+        base = _safe_artifacts_root(root, config.artifacts_root)
+    except AtestoError as exc:
+        return entries, [str(exc)], "ilegivel"
+    if not base.is_dir() or base.is_symlink():
+        return entries, issues, "ausente"
+    try:
+        slugs = sorted(
+            item.name
+            for item in base.iterdir()
+            if item.is_dir() and not item.is_symlink()
+        )
+    except OSError as exc:
+        message = f"artefatos ilegiveis em {config.artifacts_root}: {exc}"
+        return entries, [message], "ilegivel"
+    if not slugs:
+        return entries, issues, "vazio"
+    try:
+        head = git_head(root)
+        current = tree_fingerprint(root, config)
+    except AtestoError as exc:
+        return entries, [f"nao foi possivel avaliar a arvore: {exc}"], "presente"
+    found_proof = False
+    for slug in slugs:
+        directory = base / slug
+        proof_path = directory / "proof.json"
+        entry: dict[str, Any] = {
+            "slug": slug,
+            "proof": "ausente",
+            "proof_problems": [],
+            "proof_tool": "ausente",
+            "review": "ausente",
+            "review_problems": [],
+            "review_tool": "ausente",
+        }
+        proof_present = False
+        if proof_path.is_symlink():
+            found_proof = True
+            proof_present = True
+            entry["proof"] = "invalida"
+            entry["proof_problems"] = ["proof.json nao pode ser symlink"]
+            issues.append(f"{slug}: proof.json nao pode ser symlink")
+        elif proof_path.is_file():
+            found_proof = True
+            proof_present = True
+            try:
+                proof_data, proof_problems = _validate_proof(
+                    directory, root, config, head, current
+                )
+            except (AtestoError, OSError) as exc:
+                proof_data, proof_problems = None, [str(exc)]
+            entry["proof"] = "fresh" if not proof_problems else "invalida"
+            entry["proof_problems"] = list(proof_problems)
+            entry["proof_tool"] = _doctor_tool(proof_data)
+            for problem in proof_problems:
+                issues.append(f"{slug}: {problem}")
+        review_path = directory / "review.json"
+        if review_path.is_symlink():
+            entry["review"] = "invalida"
+            entry["review_problems"] = ["review.json nao pode ser symlink"]
+            issues.append(f"{slug}: review.json nao pode ser symlink")
+        elif review_path.is_file():
+            try:
+                review_data, review_problems = _validate_review(
+                    directory, root, config, head, current
+                )
+            except (AtestoError, OSError) as exc:
+                review_data, review_problems = None, [str(exc)]
+            entry["review"] = "fresh" if not review_problems else "invalida"
+            entry["review_problems"] = list(review_problems)
+            entry["review_tool"] = _doctor_tool(review_data)
+            for problem in review_problems:
+                issues.append(f"{slug}: {problem}")
+        elif proof_present and "review" in config.require:
+            issues.append(f"{slug}: review.json ausente (exigida)")
+        entries.append(entry)
+    if not found_proof:
+        issues.append(
+            f"nenhum artefato com proof.json em {config.artifacts_root}"
+        )
+    return entries, issues, "presente"
+
+
+def doctor_report(root: Path) -> dict[str, Any]:
+    """Diagnostica config, evidencia e hook sem escrever no repo.
+
+    Le a config crua primeiro: uma config que a validacao estrita rejeita
+    ainda pode ser inspecionada. Nunca levanta erro de config; problemas
+    entram em `issues` e o relatorio continua.
+    """
+    issues: list[str] = []
+
+    def add(message: str) -> None:
+        if message not in issues:
+            issues.append(message)
+
+    report: dict[str, Any] = {
+        "ok": False,
+        "issues": issues,
+        "head": None,
+        "config_name": "default",
+        "config_version": None,
+        "config_valid": True,
+        "unknown_keys": [],
+        "require": [],
+        "min_reviewers": None,
+        "test_cmd": "",
+        "artifacts_root": DEFAULT_ARTIFACTS_ROOT,
+        "test_timeout_seconds": None,
+        "hook": hook_status(root),
+        "version": VERSION,
+        "artifacts": [],
+        "artifacts_state": "ausente",
+    }
+    try:
+        report["head"] = git_head(root)
+    except AtestoError as exc:
+        add(str(exc))
+
+    path: Path | None = None
+    data: dict[str, Any] | None = None
+    try:
+        path = config_path(root)
+    except AtestoError as exc:
+        add(str(exc))
+        report["config_valid"] = False
+    if path is not None:
+        report["config_name"] = path.name
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            add(f"{path.name} ilegivel: {exc}")
+            report["config_valid"] = False
+        else:
+            if isinstance(loaded, dict):
+                data = loaded
+            else:
+                add(f"{path.name} precisa ser objeto")
+                report["config_valid"] = False
+    elif report["config_valid"]:
+        report["config_name"] = "default"
+
+    config: Config | None = None
+    if data is None:
+        config = Config(path=path or (root / "atesto.json"))
+        if path is None:
+            config.review_artifacts_paths = [config.artifacts_root]
+            report["config_version"] = config.version
+        else:
+            report["config_valid"] = False
+    else:
+        declared_version = data.get("version", 1)
+        report["config_version"] = declared_version
+        version_ok = (
+            type(declared_version) is int
+            and declared_version in CONFIG_KEYS_BY_VERSION
+        )
+        if not version_ok:
+            supported = ", ".join(
+                str(item) for item in sorted(CONFIG_KEYS_BY_VERSION)
+            )
+            add(f"{path.name} version precisa ser {supported}")
+            report["config_valid"] = False
+        known_keys = (
+            CONFIG_KEYS_BY_VERSION[declared_version]
+            if version_ok
+            else CONFIG_KEYS_V2
+        )
+        unknown_keys = sorted(set(data) - known_keys)
+        report["unknown_keys"] = unknown_keys
+        if unknown_keys:
+            add(
+                f"{path.name} tem chaves desconhecidas para version "
+                f"{declared_version}: "
+                + ", ".join(unknown_keys)
+                + "; remova-as ou mova a politica de dominio para a config "
+                "do adaptador"
+            )
+            report["config_valid"] = False
+        validation_version = (
+            declared_version
+            if version_ok
+            else max(CONFIG_KEYS_BY_VERSION)
+        )
+        sanitized = {
+            key: value
+            for key, value in data.items()
+            if key in CONFIG_KEYS_BY_VERSION[validation_version]
+        }
+        sanitized["version"] = validation_version
+        try:
+            config = Config.from_data(sanitized, path, root)
+        except AtestoError as exc:
+            add(str(exc))
+            report["config_valid"] = False
+    if config is None:
+        config = _doctor_fallback_config(data or {}, path)
+        report["config_valid"] = False
+
+    report["require"] = list(config.require)
+    report["min_reviewers"] = config.min_reviewers
+    report["test_cmd"] = config.test_cmd
+    report["artifacts_root"] = config.artifacts_root
+    report["test_timeout_seconds"] = config.test_timeout_seconds
+    if report["config_version"] is None and path is None:
+        report["config_version"] = config.version
+
+    artifacts, artifact_issues, artifacts_state = _doctor_artifacts(
+        root, config
+    )
+    report["artifacts"] = artifacts
+    report["artifacts_state"] = artifacts_state
+    for issue in artifact_issues:
+        add(issue)
+    report["ok"] = not issues
+    return report

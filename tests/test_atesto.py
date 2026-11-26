@@ -1644,6 +1644,138 @@ class AtestoTest(unittest.TestCase):
                         expected, result.stdout + result.stderr
                     )
 
+    def test_doctor_invalid_config_reports_unknown_keys_without_crashing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            proof(repo)
+            commit(repo)
+            config_path = repo / "atesto.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["statechart"] = {"state": "done"}
+            config["blast_radius"] = ["src"]
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            result = cli(repo, "doctor")
+            self.assertEqual(result.returncode, 1)
+            output = result.stdout + result.stderr
+            self.assertNotIn("Traceback", output)
+            self.assertIn("desconhecid", output)
+            self.assertIn("statechart", output)
+            self.assertIn("blast_radius", output)
+            # It still reports what it could inspect.
+            self.assertIn("version: 2", output)
+            self.assertIn("artifacts_root: docs/atesto", output)
+            self.assertIn("artefato demo", output)
+            self.assertIn(f"tool=atesto {package_version()}", output)
+
+    def test_doctor_healthy_reports_config_evidence_and_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof,review")
+            config_path = repo / "atesto.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["test_timeout_seconds"] = 30
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            proof(repo)
+            commit(repo)
+            reviewed = cli(
+                repo,
+                "review",
+                "demo",
+                "--head",
+                "HEAD",
+                "--verdict",
+                "APPROVED",
+                "--reviewer",
+                "reviewer",
+            )
+            self.assertEqual(
+                reviewed.returncode, 0, reviewed.stdout + reviewed.stderr
+            )
+            commit(repo, "review")
+            result = cli(repo, "doctor")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            output = result.stdout + result.stderr
+            self.assertIn("config: atesto.json", output)
+            self.assertIn("version: 2", output)
+            self.assertIn("require: proof,review", output)
+            self.assertIn("artifacts_root: docs/atesto", output)
+            self.assertIn("timeout: 30s", output)
+            self.assertIn("hook: ausente", output)
+            self.assertIn(f"versao: {package_version()}", output)
+            self.assertIn("artefato demo: proof fresh", output)
+            self.assertIn("artefato demo: review fresh", output)
+            self.assertEqual(
+                output.count(f"tool=atesto {package_version()}"), 2
+            )
+
+    def test_doctor_reports_stale_artifact_and_exits_nonzero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            proof(repo)
+            commit(repo)
+            (repo / "app.py").write_text("x = 2\n", encoding="utf-8")
+            commit(repo, "code")
+            result = cli(repo, "doctor")
+            self.assertEqual(result.returncode, 1)
+            output = result.stdout + result.stderr
+            self.assertIn("artefato demo", output)
+            self.assertIn("stale", output)
+
+    def test_doctor_unreadable_config_still_reports_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            (repo / "atesto.json").write_text("{nao json", encoding="utf-8")
+            result = cli(repo, "doctor")
+            self.assertEqual(result.returncode, 1)
+            output = result.stdout + result.stderr
+            self.assertNotIn("Traceback", output)
+            self.assertIn("ilegivel", output)
+            self.assertIn("hook:", output)
+            self.assertIn(f"versao: {package_version()}", output)
+
+    def test_doctor_missing_tool_is_reported_but_not_an_issue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            proof(repo)
+            commit(repo)
+            path = repo / "docs" / "atesto" / "demo" / "proof.json"
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data.pop("tool", None)
+            path.write_text(json.dumps(data), encoding="utf-8")
+            commit(repo, "artefato antigo")
+            result = cli(repo, "doctor")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            output = result.stdout + result.stderr
+            self.assertIn("artefato demo: proof fresh", output)
+            self.assertIn("tool=ausente", output)
+            self.assertIn("timeout: nenhum", output)
+
+    def test_doctor_does_not_modify_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            (repo / "docs" / "atesto").rmdir()
+            config_path = repo / "atesto.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["bogus_key"] = True
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            before = git(
+                repo, "status", "--porcelain=v1", "--untracked-files=all"
+            )
+            result = cli(repo, "doctor")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((repo / "docs" / "atesto").exists())
+            after = git(
+                repo, "status", "--porcelain=v1", "--untracked-files=all"
+            )
+            self.assertEqual(before, after)
+
     def test_check_json_exposes_tool_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = make_repo(tmp)
