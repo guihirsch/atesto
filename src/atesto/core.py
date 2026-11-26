@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 CONFIG_NAMES = ("atesto.json", "pstack.json")
 DEFAULT_ARTIFACTS_ROOT = "docs/atesto"
 PROOF_SCHEMA = 1
@@ -691,12 +691,18 @@ def _find_artifact_dir(
             )
             if problems:
                 continue
-            if "review" in config.require or (candidate / "review.json").exists():
+            review_path = candidate / "review.json"
+            if review_path.exists():
                 _review, review_problems = _validate_review(
                     candidate, root, config, head, current
                 )
                 if review_problems:
-                    continue
+                    raise GateError(
+                        f"review invalida em {candidate.name}: "
+                        + "; ".join(review_problems[:3])
+                    )
+            elif "review" in config.require:
+                continue
             valid.append(candidate)
         if len(valid) == 1:
             return valid[0]
@@ -844,6 +850,11 @@ def check(
     test_exit: int | None = None
     test_output = ""
     if config.test_cmd and run_test and not problems:
+        before_test = git(
+            root,
+            ["status", "--porcelain=v1", "--untracked-files=no"],
+            check=False,
+        )
         result = subprocess.run(
             config.test_cmd,
             cwd=root,
@@ -862,7 +873,7 @@ def check(
             ["status", "--porcelain=v1", "--untracked-files=no"],
             check=False,
         )
-        if after_test.stdout.strip():
+        if after_test.stdout != before_test.stdout:
             problems.append("test_cmd alterou arquivos rastreados")
         if git_head(root) != head:
             problems.append("test_cmd criou commit")

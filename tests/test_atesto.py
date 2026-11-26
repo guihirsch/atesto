@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import shlex
 import subprocess
 import sys
 import tempfile
@@ -521,8 +520,10 @@ class AtestoTest(unittest.TestCase):
                     result.returncode, 0, result.stdout + result.stderr
                 )
                 commit(repo, slug)
-            result = cli(repo, "check")
+            result = cli(repo, "check", "--json")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["artifacts"].endswith("/beta"))
 
     def test_multiple_artifacts_selects_current_tree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -959,18 +960,52 @@ class AtestoTest(unittest.TestCase):
     def test_symlink_para_diretorio_reprova(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = make_repo(tmp)
-            (repo / "d1").mkdir()
-            (repo / "d2").mkdir()
-            (repo / "link").symlink_to("d1")
+            outside1 = Path(tmp) / "outside1"
+            outside2 = Path(tmp) / "outside2"
+            outside1.mkdir()
+            outside2.mkdir()
+            (repo / "link").symlink_to(outside1)
             commit(repo, "link")
             init(repo)
             proof(repo)
             commit(repo, "evidence")
             (repo / "link").unlink()
-            (repo / "link").symlink_to("d2")
+            (repo / "link").symlink_to(outside2)
             result = cli(repo, "check")
             self.assertEqual(result.returncode, 1)
             self.assertIn("stale", result.stdout)
+
+    def test_test_cmd_com_arvore_suja_pre_existente(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, test_cmd="true")
+            (repo / "app.py").write_text("x = 55\n", encoding="utf-8")
+            proof(repo)
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_review_opcional_multi_artefato_falha(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            cli(
+                repo, "proof", "alpha", "--",
+                sys.executable, "-c", "print('alpha')",
+            )
+            commit(repo, "alpha")
+            cli(
+                repo, "review", "alpha", "--head", "HEAD",
+                "--verdict", "CHANGES_REQUESTED", "--reviewer", "reviewer",
+            )
+            commit(repo, "alpha review")
+            cli(
+                repo, "proof", "beta", "--",
+                sys.executable, "-c", "print('beta')",
+            )
+            commit(repo, "beta")
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("review invalida", result.stdout + result.stderr)
 
     def test_test_cmd_cache_untracked_passa(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1045,6 +1080,25 @@ class AtestoTest(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn("stale", result.stdout)
 
+    def test_hook_arvore_valida_passa(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            proof(repo)
+            commit(repo)
+            self.assertEqual(cli(repo, "hooks", "install").returncode, 0)
+            env = {**os.environ, "PYTHONPATH": str(SRC)}
+            hook = repo / ".git" / "hooks" / "pre-push"
+            result = subprocess.run(
+                [str(hook)],
+                cwd=repo,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_hook_bloqueia_arvore_stale(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = make_repo(tmp)
@@ -1052,21 +1106,8 @@ class AtestoTest(unittest.TestCase):
             proof(repo)
             commit(repo)
             self.assertEqual(cli(repo, "hooks", "install").returncode, 0)
-            shim_dir = repo / ".test-bin"
-            shim_dir.mkdir()
-            shim = shim_dir / "atesto"
-            shim.write_text(
-                "#!/bin/sh\n"
-                f"exec {shlex.quote(sys.executable)} -m atesto \"$@\"\n",
-                encoding="utf-8",
-            )
-            shim.chmod(0o755)
             (repo / "app.py").write_text("x = 99\n", encoding="utf-8")
-            env = {
-                **os.environ,
-                "PATH": str(shim_dir) + os.pathsep + os.environ["PATH"],
-                "PYTHONPATH": str(SRC),
-            }
+            env = {**os.environ, "PYTHONPATH": str(SRC)}
             hook = repo / ".git" / "hooks" / "pre-push"
             result = subprocess.run(
                 [str(hook)],
