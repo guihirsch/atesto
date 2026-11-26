@@ -74,6 +74,11 @@ cannot initialize its own gate.
 }
 ```
 
+The config is validated by
+[`atesto.schema.json`](src/atesto/schemas/atesto.schema.json) (JSON Schema
+draft 2020-12; it rejects unknown keys in both config versions). Point your
+editor at its `$id` or the local path.
+
 `review` is opt-in: add it to `require` for production or high-risk changes.
 If a `review.json` exists but is not required, it is still validated
 (fail-closed); a stale review blocks.
