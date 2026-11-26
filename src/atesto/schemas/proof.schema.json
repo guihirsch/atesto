@@ -17,6 +17,14 @@
   "properties": {
     "schema": { "const": 1 },
     "kind": { "enum": ["command"] },
+    "tool": {
+      "type": "object",
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 }
+      }
+    },
     "head": { "type": "string", "pattern": "^[0-9a-f]{7,64}$" },
     "tree_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "dirty": { "type": "boolean" },
