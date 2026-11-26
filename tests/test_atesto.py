@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -470,6 +471,7 @@ class AtestoTest(unittest.TestCase):
             init(repo)
             config_path = repo / "atesto.json"
             config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["version"] = 1
             config.pop("fingerprint_excludes", None)
             config["excludes"] = ["vendor"]
             config_path.write_text(json.dumps(config), encoding="utf-8")
@@ -480,6 +482,274 @@ class AtestoTest(unittest.TestCase):
             commit(repo, "evidence")
             (repo / "vendor" / "lib.py").write_text("v = 2\n", encoding="utf-8")
             result = cli(repo, "check")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_init_escreve_config_v2(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            config = json.loads(
+                (repo / "atesto.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(config["version"], 2)
+            proof(repo)
+            commit(repo)
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_config_v1_sem_chaves_v2_passa(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            config_path = repo / "atesto.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["version"] = 1
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            proof(repo)
+            commit(repo)
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_config_v1_rejeita_timeout_como_chave_desconhecida(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            config_path = repo / "atesto.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["version"] = 1
+            config["test_timeout_seconds"] = 5
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 2)
+            output = result.stdout + result.stderr
+            self.assertIn("test_timeout_seconds", output)
+            self.assertIn("desconhecid", output)
+
+    def test_config_version_fora_do_suportado_reprova(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            config_path = repo / "atesto.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["version"] = 3
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("1, 2", result.stdout + result.stderr)
+
+    def test_config_v2_timeout_valido(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            config_path = repo / "atesto.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["test_timeout_seconds"] = 5
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            proof(repo)
+            commit(repo)
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_check_json_sem_timeout_reporta_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, test_cmd="true")
+            proof(repo)
+            commit(repo)
+            result = cli(repo, "check", "--json")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertIsNone(payload["test_timeout_seconds"])
+            self.assertFalse(payload["timed_out"])
+
+    def test_check_json_reporta_timeout_configurado(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, test_cmd="true")
+            config_path = repo / "atesto.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["test_timeout_seconds"] = 5
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            proof(repo)
+            commit(repo)
+            result = cli(repo, "check", "--json")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["test_timeout_seconds"], 5)
+            self.assertFalse(payload["timed_out"])
+
+    def test_test_cmd_acima_do_timeout_falha_com_limite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            cmd = f"{sys.executable} -c \"import time; time.sleep(30)\""
+            init(repo, test_cmd=cmd)
+            config_path = repo / "atesto.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["test_timeout_seconds"] = 1
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            proof(repo)
+            commit(repo)
+            result = cli(repo, "check", "--json")
+            self.assertEqual(result.returncode, 1)
+            payload = json.loads(result.stdout)
+            self.assertFalse(payload["ok"])
+            self.assertTrue(payload["timed_out"])
+            self.assertEqual(payload["test_timeout_seconds"], 1)
+            problems = "\n".join(payload["problems"])
+            self.assertIn("timeout de 1s", problems)
+            self.assertIn("time.sleep(30)", problems)
+
+    def test_config_v2_timeout_invalido_reprova(self) -> None:
+        for value in (0, -1, True, "5", None, 1.5):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as tmp:
+                repo = make_repo(tmp)
+                init(repo)
+                config_path = repo / "atesto.json"
+                config = json.loads(
+                    config_path.read_text(encoding="utf-8")
+                )
+                config["test_timeout_seconds"] = value
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+                result = cli(repo, "check")
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(
+                    "test_timeout_seconds", result.stdout + result.stderr
+                )
+
+    @unittest.skipUnless(os.name == "posix", "grupos de processo sao POSIX")
+    def test_timeout_mata_grupo_de_processos(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            (repo / "hang.py").write_text(
+                "import subprocess, sys, time\n"
+                "subprocess.Popen([sys.executable, 'child.py'])\n"
+                "time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            (repo / "child.py").write_text(
+                "import signal, time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "open('started.txt', 'w', encoding='utf-8').write('x')\n"
+                "time.sleep(2)\n"
+                "open('survivor.txt', 'w', encoding='utf-8').write('x')\n",
+                encoding="utf-8",
+            )
+            init(repo, test_cmd=f"{sys.executable} hang.py")
+            config_path = repo / "atesto.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["test_timeout_seconds"] = 1
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            proof(repo)
+            commit(repo)
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("timeout de 1s", result.stdout)
+            self.assertTrue(
+                (repo / "started.txt").exists(),
+                "descendente nao chegou a rodar",
+            )
+            time.sleep(2.5)
+            self.assertFalse(
+                (repo / "survivor.txt").exists(),
+                "descendente sobreviveu ao timeout",
+            )
+
+    def test_ci_rejects_version_downgrade(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            commit(repo, "config")
+            base = git(repo, "rev-parse", "HEAD")
+            git(repo, "checkout", "-qb", "feature")
+            config_path = repo / "atesto.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["version"] = 1
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            proof(repo)
+            commit(repo, "downgrade")
+            result = cli(repo, "check", "--ci", "--base", base)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("downgrade", result.stdout + result.stderr)
+
+    def test_ci_rejects_remocao_de_timeout_da_base(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            config_path = repo / "atesto.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["test_timeout_seconds"] = 10
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            commit(repo, "config")
+            base = git(repo, "rev-parse", "HEAD")
+            git(repo, "checkout", "-qb", "feature")
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config.pop("test_timeout_seconds")
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            proof(repo)
+            commit(repo, "remove timeout")
+            result = cli(repo, "check", "--ci", "--base", base)
+            self.assertEqual(result.returncode, 1)
+            output = result.stdout + result.stderr
+            self.assertIn("test_timeout_seconds", output)
+            self.assertIn("remove", output)
+
+    def test_ci_rejects_aumento_de_timeout_da_base(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            config_path = repo / "atesto.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["test_timeout_seconds"] = 10
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            commit(repo, "config")
+            base = git(repo, "rev-parse", "HEAD")
+            git(repo, "checkout", "-qb", "feature")
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["test_timeout_seconds"] = 20
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            proof(repo)
+            commit(repo, "increase timeout")
+            result = cli(repo, "check", "--ci", "--base", base)
+            self.assertEqual(result.returncode, 1)
+            output = result.stdout + result.stderr
+            self.assertIn("test_timeout_seconds", output)
+            self.assertIn("aumenta", output)
+
+    def test_ci_aceita_reducao_de_timeout_da_base(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            config_path = repo / "atesto.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["test_timeout_seconds"] = 20
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            commit(repo, "config")
+            base = git(repo, "rev-parse", "HEAD")
+            git(repo, "checkout", "-qb", "feature")
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["test_timeout_seconds"] = 10
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            proof(repo)
+            commit(repo, "reduce timeout")
+            result = cli(repo, "check", "--ci", "--base", base, "--json")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["test_timeout_seconds"], 10)
+
+    def test_ci_aceita_timeout_quando_base_nao_tem(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            commit(repo, "config")
+            base = git(repo, "rev-parse", "HEAD")
+            git(repo, "checkout", "-qb", "feature")
+            config_path = repo / "atesto.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["test_timeout_seconds"] = 10
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            proof(repo)
+            commit(repo, "add timeout")
+            result = cli(repo, "check", "--ci", "--base", base)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_pstack_fallback_tambem_e_estrito(self) -> None:
