@@ -15,6 +15,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 ENV = {**os.environ, "PYTHONPATH": str(SRC)}
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from atesto import core  # noqa: E402
 
 
 def package_version() -> str:
@@ -1800,6 +1804,86 @@ class AtestoTest(unittest.TestCase):
                 payload.get("tool"),
                 {"name": "atesto", "version": package_version()},
             )
+
+
+class ConfigSchemaTest(unittest.TestCase):
+    """The published schema must agree with the loader's version registry."""
+
+    schema_path = SRC / "atesto" / "schemas" / "atesto.schema.json"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.schema = json.loads(cls.schema_path.read_text(encoding="utf-8"))
+        cls.variants = cls.schema["$defs"]
+
+    def test_properties_match_loader_key_sets(self) -> None:
+        self.assertEqual(
+            self.schema["$schema"],
+            "https://json-schema.org/draft/2020-12/schema",
+        )
+        self.assertEqual(set(self.variants), {"v1", "v2"})
+        for name, keys in (
+            ("v1", core.CONFIG_KEYS_V1),
+            ("v2", core.CONFIG_KEYS_V2),
+        ):
+            with self.subTest(version=name):
+                variant = self.variants[name]
+                self.assertEqual(set(variant["properties"]), set(keys))
+                self.assertIs(variant["additionalProperties"], False)
+
+    def test_types_and_constraints_match_loader_contract(self) -> None:
+        expected_types = {
+            "version": "integer",
+            "artifacts_root": "string",
+            "require": "array",
+            "min_reviewers": "integer",
+            "test_cmd": "string",
+            "review_artifacts_paths": "array",
+            "fingerprint_excludes": "array",
+            "excludes": "array",
+        }
+        for name in ("v1", "v2"):
+            properties = self.variants[name]["properties"]
+            with self.subTest(version=name):
+                for key, expected in expected_types.items():
+                    self.assertEqual(properties[key].get("type"), expected)
+                for key in (
+                    "require",
+                    "review_artifacts_paths",
+                    "fingerprint_excludes",
+                    "excludes",
+                ):
+                    self.assertEqual(
+                        properties[key]["items"].get("type"), "string"
+                    )
+                self.assertEqual(
+                    properties["min_reviewers"].get("minimum"), 1
+                )
+
+        self.assertNotIn(
+            "test_timeout_seconds", self.variants["v1"]["properties"]
+        )
+        timeout = self.variants["v2"]["properties"]["test_timeout_seconds"]
+        self.assertEqual(timeout.get("type"), "integer")
+        self.assertEqual(timeout.get("minimum"), 1)
+
+    def test_version_selects_variant(self) -> None:
+        self.assertEqual(
+            self.schema["oneOf"],
+            [{"$ref": "#/$defs/v1"}, {"$ref": "#/$defs/v2"}],
+        )
+        self.assertEqual(
+            self.variants["v1"]["properties"]["version"].get("const"), 1
+        )
+        self.assertEqual(
+            self.variants["v2"]["properties"]["version"].get("const"), 2
+        )
+        self.assertNotIn("version", self.variants["v1"].get("required", []))
+        self.assertIn("version", self.variants["v2"].get("required", []))
+
+    def test_readme_links_schema(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("src/atesto/schemas/atesto.schema.json", readme)
 
 
 if __name__ == "__main__":
