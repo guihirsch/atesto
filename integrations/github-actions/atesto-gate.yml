@@ -43,7 +43,7 @@ jobs:
       - name: Install Atesto
         run: |
           cat > "$RUNNER_TEMP/atesto-requirements.txt" <<'REQ'
-          atesto==0.2.0 --hash=sha256:765a3956723f3e6237f40cf547ffa42539dd7bafc3c0f24edf6be465e46ac72c
+          atesto==0.2.0 --hash=sha256:b4e5d9c14156986d80aaa1355cb5221fcc6237ceb2d0d71e1f33146196e07e3b
           REQ
           python -m pip install --require-hashes --no-deps \
             -r "$RUNNER_TEMP/atesto-requirements.txt"
