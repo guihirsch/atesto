@@ -18,7 +18,7 @@ ENV = {**os.environ, "PYTHONPATH": str(SRC)}
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from atesto import core  # noqa: E402
+from atesto import core
 
 
 def package_version() -> str:
