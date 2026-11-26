@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 VERSION = "0.1.1"
+TOOL_NAME = "atesto"
 CONFIG_NAMES = ("atesto.json", "pstack.json")
 DEFAULT_ARTIFACTS_ROOT = "docs/atesto"
 PROOF_SCHEMA = 1
@@ -550,6 +551,20 @@ def tree_fingerprint(
     }
 
 
+def _validate_tool(data: dict[str, Any], label: str) -> list[str]:
+    if "tool" not in data:
+        return []
+    tool = data["tool"]
+    if not isinstance(tool, dict):
+        return [f"{label} tool precisa ser objeto"]
+    problems: list[str] = []
+    for key in ("name", "version"):
+        value = tool.get(key)
+        if not isinstance(value, str) or not value.strip():
+            problems.append(f"{label} tool.{key} precisa ser string nao vazia")
+    return problems
+
+
 def _validate_proof(
     directory: Path,
     root: Path,
@@ -571,6 +586,7 @@ def _validate_proof(
         problems.append("proof.json schema precisa ser 1")
     if data.get("kind") != "command":
         problems.append("proof.json kind precisa ser command")
+    problems.extend(_validate_tool(data, "proof.json"))
     proof_head = str(data.get("head") or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{7,64}", proof_head):
         problems.append("proof.json head invalido")
@@ -648,6 +664,7 @@ def _validate_review(
         return None, ["review.json precisa ser objeto"]
     if type(data.get("schema")) is not int or data.get("schema") != REVIEW_SCHEMA:
         problems.append("review.json schema precisa ser 1")
+    problems.extend(_validate_tool(data, "review.json"))
     intent = str(data.get("intent") or "").strip()
     if not intent:
         problems.append("review.json intent vazio")
@@ -1049,6 +1066,7 @@ def check(
         "artifacts": _norm(directory.relative_to(root).as_posix()),
         "config": config.path.name if config.path else "atesto.json",
         "require": config.require,
+        "tool": proof.get("tool") if proof is not None else None,
         "proof": proof,
         "review": review,
         "test_exit": test_exit,
@@ -1099,6 +1117,7 @@ def make_proof(
     proof = {
         "schema": PROOF_SCHEMA,
         "kind": "command",
+        "tool": {"name": TOOL_NAME, "version": VERSION},
         "head": fingerprint["head"],
         "tree_sha256": fingerprint["tree_sha256"],
         "dirty": fingerprint["dirty"],
@@ -1143,6 +1162,7 @@ def write_review(
     directory = artifacts_dir(root, config, slug)
     review = {
         "schema": REVIEW_SCHEMA,
+        "tool": {"name": TOOL_NAME, "version": VERSION},
         "head": resolved,
         "tree_sha256": fingerprint["tree_sha256"],
         "intent": intent.strip() or f"review de {slug}",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 ENV = {**os.environ, "PYTHONPATH": str(SRC)}
+
+
+def package_version() -> str:
+    text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    if match is None:
+        raise AssertionError("version ausente em pyproject.toml")
+    return match.group(1)
 
 
 def cli(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -1478,6 +1487,187 @@ class AtestoTest(unittest.TestCase):
             repo = make_repo(tmp)
             init(repo)
             self.assertFalse((repo / ".github").exists())
+
+    def test_version_constant_matches_package_metadata(self) -> None:
+        result = cli(ROOT, "--version")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.strip(), f"atesto {package_version()}")
+
+    def test_proof_records_tool_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            proof(repo)
+            data = json.loads(
+                (
+                    repo / "docs" / "atesto" / "demo" / "proof.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                data.get("tool"),
+                {"name": "atesto", "version": package_version()},
+            )
+
+    def test_old_artifacts_without_tool_still_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof,review")
+            proof(repo)
+            commit(repo)
+            reviewed = cli(
+                repo,
+                "review",
+                "demo",
+                "--head",
+                "HEAD",
+                "--verdict",
+                "APPROVED",
+                "--reviewer",
+                "reviewer",
+            )
+            self.assertEqual(
+                reviewed.returncode, 0, reviewed.stdout + reviewed.stderr
+            )
+            directory = repo / "docs" / "atesto" / "demo"
+            for name in ("proof.json", "review.json"):
+                path = directory / name
+                data = json.loads(path.read_text(encoding="utf-8"))
+                data.pop("tool", None)
+                path.write_text(json.dumps(data), encoding="utf-8")
+            commit(repo, "artefatos antigos")
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_review_records_tool_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof,review")
+            proof(repo)
+            commit(repo)
+            result = cli(
+                repo,
+                "review",
+                "demo",
+                "--head",
+                "HEAD",
+                "--verdict",
+                "APPROVED",
+                "--reviewer",
+                "reviewer",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            data = json.loads(
+                (
+                    repo / "docs" / "atesto" / "demo" / "review.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                data.get("tool"),
+                {"name": "atesto", "version": package_version()},
+            )
+
+    def test_proof_tool_shape_invalida_reprova(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            proof(repo)
+            commit(repo)
+            path = repo / "docs" / "atesto" / "demo" / "proof.json"
+            original = json.loads(path.read_text(encoding="utf-8"))
+            cases = [
+                ("nao objeto", "atesto", "proof.json tool precisa ser objeto"),
+                (
+                    "sem version",
+                    {"name": "atesto"},
+                    "proof.json tool.version",
+                ),
+                (
+                    "name vazio",
+                    {"name": "", "version": package_version()},
+                    "proof.json tool.name",
+                ),
+            ]
+            for label, value, expected in cases:
+                with self.subTest(case=label):
+                    data = dict(original)
+                    data["tool"] = value
+                    path.write_text(json.dumps(data), encoding="utf-8")
+                    result = cli(repo, "check")
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(
+                        expected, result.stdout + result.stderr
+                    )
+
+    def test_review_tool_shape_invalida_reprova(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof,review")
+            proof(repo)
+            commit(repo)
+            reviewed = cli(
+                repo,
+                "review",
+                "demo",
+                "--head",
+                "HEAD",
+                "--verdict",
+                "APPROVED",
+                "--reviewer",
+                "reviewer",
+            )
+            self.assertEqual(
+                reviewed.returncode, 0, reviewed.stdout + reviewed.stderr
+            )
+            commit(repo, "review")
+            path = repo / "docs" / "atesto" / "demo" / "review.json"
+            original = json.loads(path.read_text(encoding="utf-8"))
+            cases = [
+                ("nao objeto", "atesto", "review.json tool precisa ser objeto"),
+                (
+                    "sem name",
+                    {"version": package_version()},
+                    "review.json tool.name",
+                ),
+            ]
+            for label, value, expected in cases:
+                with self.subTest(case=label):
+                    data = dict(original)
+                    data["tool"] = value
+                    path.write_text(json.dumps(data), encoding="utf-8")
+                    result = cli(repo, "check")
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(
+                        expected, result.stdout + result.stderr
+                    )
+
+    def test_check_json_exposes_tool_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof,review")
+            proof(repo)
+            commit(repo)
+            reviewed = cli(
+                repo,
+                "review",
+                "demo",
+                "--head",
+                "HEAD",
+                "--verdict",
+                "APPROVED",
+                "--reviewer",
+                "reviewer",
+            )
+            self.assertEqual(
+                reviewed.returncode, 0, reviewed.stdout + reviewed.stderr
+            )
+            commit(repo, "review")
+            result = cli(repo, "check", "--json")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(
+                payload.get("tool"),
+                {"name": "atesto", "version": package_version()},
+            )
 
 
 if __name__ == "__main__":
