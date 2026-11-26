@@ -8,6 +8,13 @@
 # `atesto.json` in CODEOWNERS; for stronger anti-tamper, materialize the
 # checker from the base branch. Until 0.2.0 is published on PyPI, install from
 # a pinned commit or a local checkout instead.
+#
+# Self-hosted runners: use a clean runner (or container) with a fresh Python
+# 3.12 and no preinstalled `atesto`/`build` packages in its site-packages. A
+# runner image or PATH that provides another atesto can silently replace the
+# hash-pinned wheel; the `atesto --version` smoke step below only catches a
+# different version, not a malicious same-version binary. Do not run this gate
+# on runners untrusted pull requests can modify.
 name: atesto gate
 
 on:
@@ -36,7 +43,7 @@ jobs:
       - name: Install Atesto
         run: |
           cat > "$RUNNER_TEMP/atesto-requirements.txt" <<'REQ'
-          atesto==0.2.0 --hash=sha256:1e771666c35dd92921aadc2fd6fb70c7e36a0011aceb0c5438955ade3bf92b46
+          atesto==0.2.0 --hash=sha256:765a3956723f3e6237f40cf547ffa42539dd7bafc3c0f24edf6be465e46ac72c
           REQ
           python -m pip install --require-hashes --no-deps \
             -r "$RUNNER_TEMP/atesto-requirements.txt"

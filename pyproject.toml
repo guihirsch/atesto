@@ -1,8 +1,9 @@
 [build-system]
-# Exact pin: the release wheel hash in
-# integrations/github-actions/atesto-gate.yml is reproducible only with this
-# backend. Update the pin and the template hash together.
-requires = ["setuptools==84.2.1"]
+# Permissive on purpose: source builds should not require the exact release
+# backend. The reproducible wheel hash in
+# integrations/github-actions/atesto-gate.yml is pinned by the build
+# environment in .github/workflows/release.yml, not by this source tree.
+requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]

@@ -194,6 +194,15 @@ def _run_doctor(args: argparse.Namespace) -> int:
     print(f"require: {','.join(report['require'])}")
     print(f"min_reviewers: {report['min_reviewers']}")
     print(f"artifacts_root: {report['artifacts_root']}")
+    test_cmd = report["test_cmd"]
+    print(f"test_cmd: {test_cmd}" if test_cmd else "test_cmd: nenhum")
+    print(
+        "review_artifacts_paths: "
+        + (",".join(report["review_artifacts_paths"]) or "nenhum")
+    )
+    print(
+        "excludes: " + (",".join(report["excludes"]) or "nenhum")
+    )
     timeout = report["test_timeout_seconds"]
     print(f"timeout: {timeout}s" if timeout is not None else "timeout: nenhum")
     print(f"hook: {report['hook']}")
@@ -211,7 +220,7 @@ def _run_doctor(args: argparse.Namespace) -> int:
                 f"(tool={entry['proof_tool']})"
             )
         if entry["review"] == "ausente":
-            if entry["proof"] != "ausente" and "review" in report["require"]:
+            if entry["review_required"]:
                 print(
                     f"artefato {entry['slug']}: review ausente (exigida)"
                 )
