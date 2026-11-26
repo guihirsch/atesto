@@ -426,6 +426,82 @@ class AtestoTest(unittest.TestCase):
                     expected, result.stdout + result.stderr
                 )
 
+    def test_unknown_config_keys_reprova_nomeando_todas(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            config_path = repo / "atesto.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["statechart"] = {"state": "done"}
+            config["blast_radius"] = ["src"]
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 2)
+            output = result.stdout + result.stderr
+            self.assertIn("desconhecid", output)
+            self.assertIn("statechart", output)
+            self.assertIn("blast_radius", output)
+
+    def test_ci_unknown_config_key_reprova_base_e_head(self) -> None:
+        for side in ("base", "head"):
+            with self.subTest(side=side), tempfile.TemporaryDirectory() as tmp:
+                repo = make_repo(tmp)
+                init(repo)
+                if side == "base":
+                    self._set_unknown_config_key(repo)
+                if side == "head":
+                    proof(repo)
+                commit(repo, "config")
+                base = git(repo, "rev-parse", "HEAD")
+                git(repo, "checkout", "-qb", "feature")
+                if side == "head":
+                    self._set_unknown_config_key(repo)
+                    commit(repo, "unknown key")
+                result = cli(repo, "check", "--ci", "--base", base)
+                self.assertEqual(result.returncode, 1)
+                output = result.stdout + result.stderr
+                expected = "config da base" if side == "base" else "config do HEAD"
+                self.assertIn(expected, output)
+                self.assertIn("bogus_key", output)
+
+    def test_config_v1_com_excludes_legado_passa(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            config_path = repo / "atesto.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config.pop("fingerprint_excludes", None)
+            config["excludes"] = ["vendor"]
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            (repo / "vendor").mkdir()
+            (repo / "vendor" / "lib.py").write_text("v = 1\n", encoding="utf-8")
+            commit(repo, "vendor")
+            proof(repo)
+            commit(repo, "evidence")
+            (repo / "vendor" / "lib.py").write_text("v = 2\n", encoding="utf-8")
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_pstack_fallback_tambem_e_estrito(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            (repo / "atesto.json").rename(repo / "pstack.json")
+            self._set_unknown_config_key(repo, name="pstack.json")
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 2)
+            output = result.stdout + result.stderr
+            self.assertIn("pstack.json", output)
+            self.assertIn("bogus_key", output)
+
+    def _set_unknown_config_key(
+        self, repo: Path, *, name: str = "atesto.json"
+    ) -> None:
+        config_path = repo / name
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["bogus_key"] = "x"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
     def test_ci_remove_exclude_nao_fica_stale(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = make_repo(tmp)

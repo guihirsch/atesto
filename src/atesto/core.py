@@ -32,6 +32,23 @@ MAX_OUTPUT_BYTES = 2_000_000
 VALID_REQUIREMENTS = {"proof", "review"}
 VALID_VERDICTS = {"APPROVED", "CHANGES_REQUESTED"}
 
+# Top-level keys accepted for each config version. A key that is not in the
+# set for the declared version is an error: the gate must not silently
+# under-enforce a config that looks stronger than it is.
+CONFIG_KEYS_V1 = frozenset(
+    {
+        "version",
+        "artifacts_root",
+        "require",
+        "min_reviewers",
+        "test_cmd",
+        "review_artifacts_paths",
+        "fingerprint_excludes",
+        "excludes",
+    }
+)
+CONFIG_KEYS_BY_VERSION: dict[int, frozenset[str]] = {1: CONFIG_KEYS_V1}
+
 
 class AtestoError(Exception):
     """Erro de uso/configuracao."""
@@ -236,8 +253,19 @@ class Config:
         if not isinstance(data, dict):
             raise AtestoError(f"{path.name} precisa ser objeto")
         version = data.get("version", 1)
-        if type(version) is not int or version != 1:
-            raise AtestoError(f"{path.name} version precisa ser 1")
+        if type(version) is not int or version not in CONFIG_KEYS_BY_VERSION:
+            supported = ", ".join(
+                str(item) for item in sorted(CONFIG_KEYS_BY_VERSION)
+            )
+            raise AtestoError(f"{path.name} version precisa ser {supported}")
+        unknown_keys = sorted(set(data) - CONFIG_KEYS_BY_VERSION[version])
+        if unknown_keys:
+            raise AtestoError(
+                f"{path.name} tem chaves desconhecidas para version {version}: "
+                + ", ".join(unknown_keys)
+                + "; remova-as ou mova a politica de dominio para a config "
+                "do adaptador"
+            )
         artifacts_root = data.get("artifacts_root", DEFAULT_ARTIFACTS_ROOT)
         if not isinstance(artifacts_root, str) or not artifacts_root.strip():
             raise AtestoError(f"{path.name} artifacts_root invalido")
@@ -765,7 +793,10 @@ def check(
             base_data = json.loads(shown.stdout)
         except ValueError as exc:
             raise GateError(f"{base_name} da base e invalido: {exc}") from exc
-        config = Config.from_data(base_data, root / base_name, root)
+        try:
+            config = Config.from_data(base_data, root / base_name, root)
+        except AtestoError as exc:
+            raise GateError(f"config da base invalida: {exc}") from exc
         head_name = None
         for name in CONFIG_NAMES:
             if git(
@@ -784,7 +815,10 @@ def check(
             head_data = json.loads(shown_head.stdout)
         except ValueError as exc:
             raise GateError(f"{head_name} do HEAD ilegivel: {exc}") from exc
-        head_config = Config.from_data(head_data, root / head_name, root)
+        try:
+            head_config = Config.from_data(head_data, root / head_name, root)
+        except AtestoError as exc:
+            raise GateError(f"config do HEAD invalida: {exc}") from exc
         missing = set(config.require) - set(head_config.require)
         if missing:
             raise GateError(
