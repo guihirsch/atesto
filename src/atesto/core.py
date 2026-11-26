@@ -22,6 +22,7 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,41 @@ TEST_OUTPUT_TAIL = 4000
 TERMINATION_GRACE_SECONDS = 0.5
 VALID_REQUIREMENTS = {"proof", "review"}
 VALID_VERDICTS = {"APPROVED", "CHANGES_REQUESTED"}
+TOOL_VERSION_PATTERN = re.compile(
+    r"^\d+\.\d+\.\d+(?:[.+-]?[0-9A-Za-z]+(?:[.+-][0-9A-Za-z]+)*)?$"
+)
+MIGRATION_NOTE = (
+    "veja a nota de migracao em README.md (Migração para 0.2.0) "
+    "e CHANGELOG.md"
+)
+
+
+class ArtifactStatus(str, Enum):
+    """Valores estaveis para o estado dos artefatos no `doctor`."""
+
+    ABSENT = "ausente"
+    EMPTY = "vazio"
+    FRESH = "fresh"
+    INVALID = "invalida"
+    UNREADABLE = "ilegivel"
+    PRESENT = "presente"
+
+    def __str__(self) -> str:
+        return self.value
+
+
+def _uses_process_groups() -> bool:
+    return os.name == "posix"
+
+
+def _unknown_keys_message(name: str, version: Any, keys: list[str]) -> str:
+    return (
+        f"{name} tem chaves desconhecidas para version {version}: "
+        + ", ".join(keys)
+        + "; remova-as ou mova a politica de dominio para a config do "
+        "adaptador; "
+        + MIGRATION_NOTE
+    )
 
 # Top-level keys accepted for each config version. A key that is not in the
 # set for the declared version is an error: the gate must not silently
@@ -247,7 +283,8 @@ def config_path(root: Path) -> Path | None:
 
 @dataclass
 class Config:
-    version: int = 2
+    # Sem `version` explicita a config e v1; `init` grava v2.
+    version: int = 1
     artifacts_root: str = DEFAULT_ARTIFACTS_ROOT
     require: list[str] = field(default_factory=lambda: ["proof"])
     min_reviewers: int = 1
@@ -282,10 +319,7 @@ class Config:
         unknown_keys = sorted(set(data) - CONFIG_KEYS_BY_VERSION[version])
         if unknown_keys:
             raise AtestoError(
-                f"{path.name} tem chaves desconhecidas para version {version}: "
-                + ", ".join(unknown_keys)
-                + "; remova-as ou mova a politica de dominio para a config "
-                "do adaptador"
+                _unknown_keys_message(path.name, version, unknown_keys)
             )
         artifacts_root = data.get("artifacts_root", DEFAULT_ARTIFACTS_ROOT)
         if not isinstance(artifacts_root, str) or not artifacts_root.strip():
@@ -562,10 +596,17 @@ def _validate_tool(data: dict[str, Any], label: str) -> list[str]:
     if not isinstance(tool, dict):
         return [f"{label} tool precisa ser objeto"]
     problems: list[str] = []
-    for key in ("name", "version"):
-        value = tool.get(key)
-        if not isinstance(value, str) or not value.strip():
-            problems.append(f"{label} tool.{key} precisa ser string nao vazia")
+    name = tool.get("name")
+    if not isinstance(name, str) or not name.strip():
+        problems.append(f"{label} tool.name precisa ser string nao vazia")
+    version = tool.get("version")
+    if not isinstance(version, str) or not version.strip():
+        problems.append(f"{label} tool.version precisa ser string nao vazia")
+    elif TOOL_VERSION_PATTERN.fullmatch(version.strip()) is None:
+        problems.append(
+            f"{label} tool.version precisa ser semver-like "
+            "(ex.: 0.2.0, 0.3.0rc1)"
+        )
     return problems
 
 
@@ -820,7 +861,7 @@ def _terminate_test_process(process: subprocess.Popen[str]) -> None:
     seguido de SIGKILL depois de uma graca curta. Em plataformas sem grupos de
     processo apenas o filho direto e encerrado (limitacao conhecida).
     """
-    if os.name != "posix":
+    if not _uses_process_groups():
         process.terminate()
         try:
             process.wait(timeout=TERMINATION_GRACE_SECONDS)
@@ -868,9 +909,9 @@ def _run_test_cmd(
         )
         output = (result.stdout + result.stderr)[-TEST_OUTPUT_TAIL:]
         return result.returncode, output, False
-    session: dict[str, bool] = {}
-    if os.name == "posix":
-        session["start_new_session"] = True
+    popen_kwargs: dict[str, bool] = {}
+    if _uses_process_groups():
+        popen_kwargs["start_new_session"] = True
     process = subprocess.Popen(
         command,
         cwd=root,
@@ -879,7 +920,7 @@ def _run_test_cmd(
         stderr=subprocess.PIPE,
         text=True,
         errors="surrogateescape",
-        **session,
+        **popen_kwargs,
     )
     try:
         stdout, stderr = process.communicate(timeout=timeout_seconds)
@@ -1348,7 +1389,7 @@ def _doctor_fallback_config(data: dict[str, Any], path: Path | None) -> Config:
             except AtestoError:
                 continue
         excludes = cleaned
-    version = data.get("version", 2)
+    version = data.get("version", 1)
     if type(version) is not int or version not in CONFIG_KEYS_BY_VERSION:
         version = max(CONFIG_KEYS_BY_VERSION)
     return Config(
@@ -1367,19 +1408,10 @@ def _doctor_fallback_config(data: dict[str, Any], path: Path | None) -> Config:
 def _doctor_tool(data: dict[str, Any] | None) -> str:
     if not isinstance(data, dict) or "tool" not in data:
         return "ausente"
+    if _validate_tool(data, ""):
+        return "invalido"
     tool = data["tool"]
-    if not isinstance(tool, dict):
-        return "invalido"
-    name = tool.get("name")
-    version = tool.get("version")
-    if (
-        not isinstance(name, str)
-        or not name.strip()
-        or not isinstance(version, str)
-        or not version.strip()
-    ):
-        return "invalido"
-    return f"{name.strip()} {version.strip()}"
+    return f"{tool['name'].strip()} {tool['version'].strip()}"
 
 
 def _doctor_artifacts(
@@ -1388,12 +1420,18 @@ def _doctor_artifacts(
     """Inspeciona os artefatos sem escrever e sem abortar no primeiro erro."""
     entries: list[dict[str, Any]] = []
     issues: list[str] = []
+    required = ", ".join(config.require)
     try:
         base = _safe_artifacts_root(root, config.artifacts_root)
     except AtestoError as exc:
-        return entries, [str(exc)], "ilegivel"
+        return entries, [str(exc)], ArtifactStatus.UNREADABLE
     if not base.is_dir() or base.is_symlink():
-        return entries, issues, "ausente"
+        if config.require:
+            issues.append(
+                f"artefatos ausentes em {config.artifacts_root} "
+                f"(exigido: {required})"
+            )
+        return entries, issues, ArtifactStatus.ABSENT
     try:
         slugs = sorted(
             item.name
@@ -1402,51 +1440,63 @@ def _doctor_artifacts(
         )
     except OSError as exc:
         message = f"artefatos ilegiveis em {config.artifacts_root}: {exc}"
-        return entries, [message], "ilegivel"
+        return entries, [message], ArtifactStatus.UNREADABLE
     if not slugs:
-        return entries, issues, "vazio"
+        if config.require:
+            issues.append(
+                f"nenhum artefato em {config.artifacts_root} "
+                f"(exigido: {required})"
+            )
+        return entries, issues, ArtifactStatus.EMPTY
     try:
         head = git_head(root)
         current = tree_fingerprint(root, config)
     except AtestoError as exc:
-        return entries, [f"nao foi possivel avaliar a arvore: {exc}"], "presente"
+        return (
+            entries,
+            [f"nao foi possivel avaliar a arvore: {exc}"],
+            ArtifactStatus.PRESENT,
+        )
     found_proof = False
+    review_required = "review" in config.require
     for slug in slugs:
         directory = base / slug
         proof_path = directory / "proof.json"
         entry: dict[str, Any] = {
             "slug": slug,
-            "proof": "ausente",
+            "proof": ArtifactStatus.ABSENT,
             "proof_problems": [],
             "proof_tool": "ausente",
-            "review": "ausente",
+            "review": ArtifactStatus.ABSENT,
             "review_problems": [],
             "review_tool": "ausente",
+            "review_required": review_required,
         }
-        proof_present = False
         if proof_path.is_symlink():
             found_proof = True
-            proof_present = True
-            entry["proof"] = "invalida"
+            entry["proof"] = ArtifactStatus.INVALID
             entry["proof_problems"] = ["proof.json nao pode ser symlink"]
             issues.append(f"{slug}: proof.json nao pode ser symlink")
         elif proof_path.is_file():
             found_proof = True
-            proof_present = True
             try:
                 proof_data, proof_problems = _validate_proof(
                     directory, root, config, head, current
                 )
             except (AtestoError, OSError) as exc:
                 proof_data, proof_problems = None, [str(exc)]
-            entry["proof"] = "fresh" if not proof_problems else "invalida"
+            entry["proof"] = (
+                ArtifactStatus.FRESH
+                if not proof_problems
+                else ArtifactStatus.INVALID
+            )
             entry["proof_problems"] = list(proof_problems)
             entry["proof_tool"] = _doctor_tool(proof_data)
             for problem in proof_problems:
                 issues.append(f"{slug}: {problem}")
         review_path = directory / "review.json"
         if review_path.is_symlink():
-            entry["review"] = "invalida"
+            entry["review"] = ArtifactStatus.INVALID
             entry["review_problems"] = ["review.json nao pode ser symlink"]
             issues.append(f"{slug}: review.json nao pode ser symlink")
         elif review_path.is_file():
@@ -1456,19 +1506,23 @@ def _doctor_artifacts(
                 )
             except (AtestoError, OSError) as exc:
                 review_data, review_problems = None, [str(exc)]
-            entry["review"] = "fresh" if not review_problems else "invalida"
+            entry["review"] = (
+                ArtifactStatus.FRESH
+                if not review_problems
+                else ArtifactStatus.INVALID
+            )
             entry["review_problems"] = list(review_problems)
             entry["review_tool"] = _doctor_tool(review_data)
             for problem in review_problems:
                 issues.append(f"{slug}: {problem}")
-        elif proof_present and "review" in config.require:
+        elif review_required:
             issues.append(f"{slug}: review.json ausente (exigida)")
         entries.append(entry)
     if not found_proof:
         issues.append(
             f"nenhum artefato com proof.json em {config.artifacts_root}"
         )
-    return entries, issues, "presente"
+    return entries, issues, ArtifactStatus.PRESENT
 
 
 def doctor_report(root: Path) -> dict[str, Any]:
@@ -1496,11 +1550,13 @@ def doctor_report(root: Path) -> dict[str, Any]:
         "min_reviewers": None,
         "test_cmd": "",
         "artifacts_root": DEFAULT_ARTIFACTS_ROOT,
+        "review_artifacts_paths": [],
+        "excludes": [],
         "test_timeout_seconds": None,
         "hook": hook_status(root),
         "version": VERSION,
         "artifacts": [],
-        "artifacts_state": "ausente",
+        "artifacts_state": ArtifactStatus.ABSENT,
     }
     try:
         report["head"] = git_head(root)
@@ -1559,13 +1615,7 @@ def doctor_report(root: Path) -> dict[str, Any]:
         unknown_keys = sorted(set(data) - known_keys)
         report["unknown_keys"] = unknown_keys
         if unknown_keys:
-            add(
-                f"{path.name} tem chaves desconhecidas para version "
-                f"{declared_version}: "
-                + ", ".join(unknown_keys)
-                + "; remova-as ou mova a politica de dominio para a config "
-                "do adaptador"
-            )
+            add(_unknown_keys_message(path.name, declared_version, unknown_keys))
             report["config_valid"] = False
         validation_version = (
             declared_version
@@ -1591,6 +1641,8 @@ def doctor_report(root: Path) -> dict[str, Any]:
     report["min_reviewers"] = config.min_reviewers
     report["test_cmd"] = config.test_cmd
     report["artifacts_root"] = config.artifacts_root
+    report["review_artifacts_paths"] = list(config.review_artifacts_paths)
+    report["excludes"] = list(config.excludes)
     report["test_timeout_seconds"] = config.test_timeout_seconds
     if report["config_version"] is None and path is None:
         report["config_version"] = config.version

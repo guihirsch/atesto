@@ -63,7 +63,9 @@ cannot initialize its own gate.
 
 ## Config
 
-`atesto.json` at the repo root (v2, written by `atesto init`):
+`atesto.json` at the repo root. **Example** v2 config (not the exact file
+`atesto init` writes: the optional `test_timeout_seconds` and
+`fingerprint_excludes` below are shown here, and `init` leaves them out):
 
 ```json
 {
@@ -78,6 +80,20 @@ cannot initialize its own gate.
 }
 ```
 
+`atesto init --require proof` writes the smaller config below; add optional
+keys yourself when you need them:
+
+```json
+{
+  "version": 2,
+  "artifacts_root": "docs/atesto",
+  "require": ["proof"],
+  "min_reviewers": 1,
+  "test_cmd": "",
+  "review_artifacts_paths": ["docs/atesto"]
+}
+```
+
 Two config versions are supported:
 
 - **v1** is the original key set. Omitting `version` means v1.
@@ -88,12 +104,31 @@ Both versions reject **unknown top-level keys** in every mode (`check`,
 `check --ci`, `proof`, `review`, `doctor`), naming all unknown keys at once.
 There is no warning-only mode: a config that looks stronger than the tool can
 enforce fails instead of silently under-enforcing. `check --ci` also rejects
-unknown keys and a config `version` lower than the base.
+unknown keys and a config `version` lower than the base. The error points to
+[Migração para 0.2.0](#migração-para-020) and the CHANGELOG.
 
 The config is validated by
 [`atesto.schema.json`](src/atesto/schemas/atesto.schema.json) (JSON Schema
 draft 2020-12; `additionalProperties: false` in both variants). Point your
 editor at its `$id` or the local path.
+
+### Migração para 0.2.0
+
+Unknown top-level keys now fail closed. This is breaking by design: a config
+that appears to require more evidence must not run with only the subset the
+tool understands. Before upgrading from 0.1.x:
+
+1. Remove every key the core does not recognize from `atesto.json` (or
+   `pstack.json`).
+2. Move adapter/domain policy — for example `statechart`, `blast_radius`,
+   decisions or per-path requirements — to the adapter's own config, next to
+   the adapter that consumes it.
+3. Run `atesto doctor` to list unknown keys and effective config, then
+   `atesto check` to confirm the gate still passes.
+
+`version` is not a free-form migration switch: v1 keeps the original key set,
+v2 adds `test_timeout_seconds` and requires `"version": 2`. A config that
+omits `version` is v1.
 
 ### Test timeout
 
@@ -124,9 +159,12 @@ without `tool` remain valid. `check --json` exposes the proof's `tool` and
 ### Doctor
 
 `atesto doctor` reads the raw config without hard-failing and reports unknown
-keys, effective keys, version, timeout, artifacts root, artifact freshness,
-hook status and tool version. It exits nonzero when it finds an issue, so it
-shows why a gate would fail before `check` does.
+keys, effective keys (`require`, `min_reviewers`, `test_cmd`,
+`review_artifacts_paths`, `excludes`, `artifacts_root`, timeout), version,
+artifact freshness, hook status and tool version. It exits nonzero when it
+finds an issue, including missing required evidence when an artifacts root is
+absent or empty, so it shows why a gate would fail before `check` does. A
+missing hook is informational, not an issue.
 
 ### Domain policy belongs to adapters
 
@@ -183,16 +221,20 @@ recorded, so keep secrets out of arguments too).
 
 The 0.2.0 wheel is built reproducibly so the CI template can pin a real hash:
 
-- `[build-system]` pins `setuptools==84.2.1`;
-- `.github/workflows/release.yml` pins `build==1.6.1` and sets
-  `SOURCE_DATE_EPOCH=1795651200` (2026-11-26T00:00:00Z);
+- `[build-system]` stays permissive (`setuptools>=69`) so source builds are
+  not tied to the release backend;
+- `.github/workflows/release.yml` pins the build environment
+  (`build==1.6.1`, `setuptools==84.2.1`, `wheel==0.48.0`), runs
+  `python -m build --no-isolation`, and sets `SOURCE_DATE_EPOCH=1795651200`
+  (2026-11-26T00:00:00Z);
 - rebuilding `atesto-0.2.0-py3-none-any.whl` from the same tree with those
   settings must produce the sha256 in
   `integrations/github-actions/atesto-gate.yml`.
 
 After a release, recompute with
-`sha256sum dist/atesto-0.2.0-py3-none-any.whl`. If the build backend or this
-fixed timestamp changes, update the template hash in the same change.
+`sha256sum dist/atesto-0.2.0-py3-none-any.whl`. If the pinned build
+environment or the fixed timestamp changes, update the template hash in the
+same change.
 
 ## Development
 

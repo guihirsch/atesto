@@ -455,6 +455,9 @@ class AtestoTest(unittest.TestCase):
             self.assertIn("desconhecid", output)
             self.assertIn("statechart", output)
             self.assertIn("blast_radius", output)
+            self.assertIn("migra", output.lower())
+            self.assertIn("README.md", output)
+            self.assertIn("CHANGELOG.md", output)
 
     def test_ci_unknown_config_key_reprova_base_e_head(self) -> None:
         for side in ("base", "head"):
@@ -509,6 +512,25 @@ class AtestoTest(unittest.TestCase):
             commit(repo)
             result = cli(repo, "check")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_init_writes_minimal_v2_config_documented_in_readme(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            config = json.loads(
+                (repo / "atesto.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                config,
+                {
+                    "version": 2,
+                    "artifacts_root": "docs/atesto",
+                    "require": ["proof"],
+                    "min_reviewers": 1,
+                    "test_cmd": "",
+                    "review_artifacts_paths": ["docs/atesto"],
+                },
+            )
 
     def test_config_v1_sem_chaves_v2_passa(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1644,6 +1666,71 @@ class AtestoTest(unittest.TestCase):
                         expected, result.stdout + result.stderr
                     )
 
+    def test_proof_tool_version_requires_semver_like(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            proof(repo)
+            commit(repo)
+            path = repo / "docs" / "atesto" / "demo" / "proof.json"
+            original = json.loads(path.read_text(encoding="utf-8"))
+            for version in ("0.3.0rc1", "0.3.0-dev.1", "1.0.0+build.5"):
+                with self.subTest(valid=version):
+                    data = dict(original)
+                    data["tool"] = {"name": "atesto", "version": version}
+                    path.write_text(json.dumps(data), encoding="utf-8")
+                    result = cli(repo, "check")
+                    self.assertEqual(
+                        result.returncode, 0, result.stdout + result.stderr
+                    )
+            for version in ("banana", "1.2", "v1.2.3", ""):
+                with self.subTest(invalid=version):
+                    data = dict(original)
+                    data["tool"] = {"name": "atesto", "version": version}
+                    path.write_text(json.dumps(data), encoding="utf-8")
+                    result = cli(repo, "check")
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn("tool.version", result.stdout)
+
+    def test_review_tool_version_requires_semver_like(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof,review")
+            proof(repo)
+            commit(repo)
+            reviewed = cli(
+                repo,
+                "review",
+                "demo",
+                "--head",
+                "HEAD",
+                "--verdict",
+                "APPROVED",
+                "--reviewer",
+                "reviewer",
+            )
+            self.assertEqual(
+                reviewed.returncode, 0, reviewed.stdout + reviewed.stderr
+            )
+            commit(repo, "review")
+            path = repo / "docs" / "atesto" / "demo" / "review.json"
+            original = json.loads(path.read_text(encoding="utf-8"))
+            for version in ("0.3.0rc1", "0.3.0-dev.1", "1.0.0+build.5"):
+                with self.subTest(valid=version):
+                    data = dict(original)
+                    data["tool"] = {"name": "atesto", "version": version}
+                    path.write_text(json.dumps(data), encoding="utf-8")
+                    result = cli(repo, "check")
+                    self.assertEqual(
+                        result.returncode, 0, result.stdout + result.stderr
+                    )
+            data = dict(original)
+            data["tool"] = {"name": "atesto", "version": "banana"}
+            path.write_text(json.dumps(data), encoding="utf-8")
+            result = cli(repo, "check")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("tool.version", result.stdout)
+
     def test_doctor_invalid_config_reports_unknown_keys_without_crashing(
         self,
     ) -> None:
@@ -1664,6 +1751,7 @@ class AtestoTest(unittest.TestCase):
             self.assertIn("desconhecid", output)
             self.assertIn("statechart", output)
             self.assertIn("blast_radius", output)
+            self.assertIn("migra", output.lower())
             # It still reports what it could inspect.
             self.assertIn("version: 2", output)
             self.assertIn("artifacts_root: docs/atesto", output)
@@ -1755,6 +1843,85 @@ class AtestoTest(unittest.TestCase):
             self.assertIn("artefato demo: proof fresh", output)
             self.assertIn("tool=ausente", output)
             self.assertIn("timeout: nenhum", output)
+
+    def test_doctor_missing_artifacts_with_requirement_exits_nonzero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            (repo / "docs" / "atesto").rmdir()
+            result = cli(repo, "doctor")
+            self.assertEqual(result.returncode, 1)
+            output = result.stdout + result.stderr
+            self.assertIn("artefatos ausentes", output)
+            self.assertIn("proof", output)
+
+    def test_doctor_empty_artifacts_root_exits_nonzero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            result = cli(repo, "doctor")
+            self.assertEqual(result.returncode, 1)
+            output = result.stdout + result.stderr
+            self.assertIn("artefatos: vazio", output)
+            self.assertIn("nenhum artefato", output)
+
+    def test_doctor_required_review_missing_exits_nonzero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof,review")
+            proof(repo)
+            commit(repo)
+            result = cli(repo, "doctor")
+            self.assertEqual(result.returncode, 1)
+            output = result.stdout + result.stderr
+            self.assertIn("artefato demo: review ausente (exigida)", output)
+
+    def test_doctor_without_config_reports_defaults_and_missing_evidence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            result = cli(repo, "doctor")
+            self.assertEqual(result.returncode, 1)
+            output = result.stdout + result.stderr
+            self.assertIn("config: default", output)
+            self.assertIn("version: 1", output)
+            self.assertIn("require: proof", output)
+            self.assertIn("artefatos ausentes", output)
+
+    def test_doctor_symlink_config_exits_nonzero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            target = Path(tmp) / "outside-atesto.json"
+            target.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "require": ["proof"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (repo / "atesto.json").symlink_to(target)
+            result = cli(repo, "doctor")
+            self.assertEqual(result.returncode, 1)
+            output = result.stdout + result.stderr
+            self.assertIn("symlink", output)
+
+    def test_doctor_reports_effective_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, test_cmd="pytest -q")
+            config_path = repo / "atesto.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["review_artifacts_paths"] = ["docs/atesto"]
+            config["fingerprint_excludes"] = ["vendor"]
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            result = cli(repo, "doctor")
+            output = result.stdout + result.stderr
+            self.assertIn("test_cmd: pytest -q", output)
+            self.assertIn("review_artifacts_paths: docs/atesto", output)
+            self.assertIn("excludes: vendor", output)
 
     def test_doctor_does_not_modify_repo(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1886,6 +2053,50 @@ class ConfigSchemaTest(unittest.TestCase):
         self.assertIn("src/atesto/schemas/atesto.schema.json", readme)
 
 
+class ArtifactSchemaTest(unittest.TestCase):
+    """Proof/review schemas must reject non-semver tool versions."""
+
+    def test_tool_version_pattern_is_semver_like(self) -> None:
+        for name in ("proof", "review"):
+            with self.subTest(schema=name):
+                schema = json.loads(
+                    (
+                        SRC / "atesto" / "schemas" / f"{name}.schema.json"
+                    ).read_text(encoding="utf-8")
+                )
+                pattern = schema["properties"]["tool"]["properties"][
+                    "version"
+                ]["pattern"]
+                for version in (
+                    "0.2.0",
+                    "0.3.0rc1",
+                    "0.3.0-dev.1",
+                    "1.0.0+build.5",
+                ):
+                    self.assertIsNotNone(
+                        re.fullmatch(pattern, version), version
+                    )
+                for version in ("banana", "1.2", "v1.2.3"):
+                    self.assertIsNone(
+                        re.fullmatch(pattern, version), version
+                    )
+
+    def test_tool_version_pattern_matches_loader(self) -> None:
+        for name in ("proof", "review"):
+            with self.subTest(schema=name):
+                schema = json.loads(
+                    (
+                        SRC / "atesto" / "schemas" / f"{name}.schema.json"
+                    ).read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    schema["properties"]["tool"]["properties"]["version"][
+                        "pattern"
+                    ],
+                    core.TOOL_VERSION_PATTERN.pattern,
+                )
+
+
 class ReleaseMetadataTest(unittest.TestCase):
     """Release artifacts must stay consistent with the packaged version."""
 
@@ -1900,21 +2111,26 @@ class ReleaseMetadataTest(unittest.TestCase):
         self.assertIn("--require-hashes", template)
         self.assertIn("--no-deps", template)
         self.assertIn('python-version: "3.12"', template)
+        self.assertIn("self-hosted", template.lower())
         smoke = template.index("atesto --version")
         gate = template.index("atesto check --ci")
         self.assertLess(smoke, gate)
 
-    def test_release_build_pins_inputs_and_timestamp(self) -> None:
+    def test_release_build_pins_environment_not_source_metadata(self) -> None:
         workflow = (
             ROOT / ".github" / "workflows" / "release.yml"
         ).read_text(encoding="utf-8")
         self.assertRegex(workflow, r'SOURCE_DATE_EPOCH:\s*"[0-9]{9,10}"')
-        self.assertIn("python -m build", workflow)
+        self.assertIn('"build==1.6.1"', workflow)
+        self.assertIn('"setuptools==84.2.1"', workflow)
+        self.assertIn('"wheel==', workflow)
+        self.assertIn("python -m build --no-isolation", workflow)
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertRegex(
-            pyproject,
-            r'\[build-system\][\s\S]*?"setuptools==[0-9][^"]*"',
-        )
+        build_system = pyproject.split("[build-system]", 1)[1].split(
+            "[project]", 1
+        )[0]
+        self.assertNotIn("==", build_system)
+        self.assertRegex(build_system, r'setuptools>=[0-9]')
 
     def test_changelog_documents_breaking_release(self) -> None:
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
@@ -1937,6 +2153,34 @@ class ReleaseMetadataTest(unittest.TestCase):
         ):
             with self.subTest(term=term):
                 self.assertIn(term, readme)
+
+    def test_readme_config_block_is_labeled_example(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("**Example**", readme)
+        self.assertIn("not the exact file", readme)
+        self.assertIn("`atesto init` writes", readme)
+        blocks = [
+            json.loads(block)
+            for block in re.findall(
+                r"```json\n(.*?)```", readme, re.DOTALL
+            )
+            if '"artifacts_root"' in block
+        ]
+        self.assertEqual(len(blocks), 2, blocks)
+        example, init_output = blocks
+        self.assertLessEqual(set(example), core.CONFIG_KEYS_V2)
+        self.assertIn("test_timeout_seconds", example)
+        self.assertEqual(
+            set(init_output),
+            {
+                "version",
+                "artifacts_root",
+                "require",
+                "min_reviewers",
+                "test_cmd",
+                "review_artifacts_paths",
+            },
+        )
 
 
 if __name__ == "__main__":
