@@ -51,10 +51,16 @@ def _parser() -> argparse.ArgumentParser:
     review = sub.add_parser("review", help="grava review.json no head")
     review.add_argument("slug")
     review.add_argument("--root", default=".")
-    review.add_argument("--head", default="HEAD")
-    review.add_argument("--verdict", default="APPROVED")
-    review.add_argument("--reviewer", action="append", default=[])
-    review.add_argument("--intent", default="")
+    review.add_argument("--head", default=None)
+    review.add_argument("--verdict", default=None)
+    review.add_argument("--reviewer", action="append", default=None)
+    review.add_argument("--intent", default=None)
+    review.add_argument(
+        "--from-json",
+        metavar="PATH",
+        default=None,
+        help="grava o review a partir de um contrato JSON v1",
+    )
 
     check = sub.add_parser("check", help="valida prova/review no head")
     check.add_argument("--root", default=".")
@@ -132,14 +138,34 @@ def _run_proof(args: argparse.Namespace) -> int:
 
 def _run_review(args: argparse.Namespace) -> int:
     root = _root(args.root)
-    directory = core.write_review(
-        root,
-        args.slug,
-        head=args.head,
-        verdict=args.verdict,
-        reviewers=args.reviewer,
-        intent=args.intent,
-    )
+    manual_flags = [
+        name
+        for name, value in (
+            ("--head", args.head),
+            ("--verdict", args.verdict),
+            ("--reviewer", args.reviewer),
+            ("--intent", args.intent),
+        )
+        if value is not None
+    ]
+    if args.from_json is not None:
+        if manual_flags:
+            raise core.AtestoError(
+                "review --from-json nao combina com flags manuais: "
+                + ", ".join(manual_flags)
+            )
+        directory = core.write_review_from_json(
+            root, args.slug, Path(args.from_json).expanduser()
+        )
+    else:
+        directory = core.write_review(
+            root,
+            args.slug,
+            head=args.head if args.head is not None else "HEAD",
+            verdict=args.verdict if args.verdict is not None else "APPROVED",
+            reviewers=args.reviewer or [],
+            intent=args.intent if args.intent is not None else "",
+        )
     print(f"atesto: review salvo em {directory / 'review.json'}")
     return 0
 

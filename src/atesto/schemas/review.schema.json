@@ -22,6 +22,15 @@
         "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+(?:[.+-]?[0-9A-Za-z]+(?:[.+-][0-9A-Za-z]+)*)?$" }
       }
     },
+    "source": {
+      "type": "object",
+      "required": ["kind", "ref"],
+      "properties": {
+        "kind": { "enum": ["github", "gitlab", "json"] },
+        "ref": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
     "head": { "type": "string", "pattern": "^[0-9a-f]{7,64}$" },
     "tree_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "intent": { "type": "string", "minLength": 1 },
