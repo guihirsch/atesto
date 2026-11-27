@@ -12,7 +12,7 @@ of them edit or replace existing CI.
 | CircleCI | `circleci.yml` |
 | Buildkite | `buildkite.yml` |
 
-Every snippet pins `ghcr.io/guihirsch/atesto:0.2.0`, fetches full history, sets
+Every snippet pins `ghcr.io/guihirsch/atesto:0.3.0`, fetches full history, sets
 `BASE_REF` and runs `atesto check --ci --base "$BASE_REF"`. The image version
 must match `pyproject.toml`; `tests/test_atesto.py::CISnippetTest` fails when a
 snippet drifts.

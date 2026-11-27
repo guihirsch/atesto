@@ -26,7 +26,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 TOOL_NAME = "atesto"
 CONFIG_NAMES = ("atesto.json", "pstack.json")
 DEFAULT_ARTIFACTS_ROOT = "docs/atesto"

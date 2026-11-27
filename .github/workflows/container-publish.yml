@@ -7,12 +7,12 @@ on:
         description: Atesto version published to PyPI
         required: true
         type: string
-        default: "0.2.0"
+        default: "0.3.0"
       wheel_sha256:
         description: SHA-256 of the atesto wheel on PyPI
         required: true
         type: string
-        default: "b4e5d9c14156986d80aaa1355cb5221fcc6237ceb2d0d71e1f33146196e07e3b"
+        default: "af42b934d2a533723856333ee242c3f521428a9c48028108894b08e0cee9b25f"
 
 permissions:
   contents: read

@@ -11,21 +11,46 @@ not an agent runtime, a code review bot, a workflow engine, or a test runner.
 
 ## Quick start
 
-```bash
-python -m pip install .
-atesto init --require proof
-atesto proof demo -- python3 -c "print('ok')"
-atesto check
-```
-
-With review required:
+The full path from an empty repository to the first green check. It uses a
+manual review so no provider CLI is needed; for provider or custom approvals
+see [Review sources](#review-sources).
 
 ```bash
+# 1. Fresh repository
+mkdir atesto-demo && cd atesto-demo
+git init
+git config user.email you@example.com
+git config user.name "Your Name"
+python -m pip install "atesto==0.3.0"
+
+# 2. Enable the gate and commit the config with the code
 atesto init --require proof,review
-atesto proof demo -- pytest -q
-atesto review demo --head HEAD --verdict APPROVED --reviewer "reviewer"
+printf 'print("ok")\n' > app.py
+git add atesto.json app.py
+git commit -m "chore: initial commit"
+
+# 3. Prove the code head, then commit the evidence
+atesto proof demo -- python3 app.py
+git add docs/atesto/demo
+git commit -m "docs(atesto): proof"
+
+# 4. Review the same tree, then commit the evidence
+atesto review demo --head HEAD --verdict APPROVED --reviewer alice
+git add docs/atesto/demo
+git commit -m "docs(atesto): review"
+
+# 5. Check the head
 atesto check
+# atesto: ok
 ```
+
+`atesto check` reads the committed artifacts, recomputes the tree and prints
+`atesto: ok`. To take the review from GitHub, GitLab or a custom approval
+system instead of passing the flags by hand, use `--from-github-pr`,
+`--from-gitlab-mr` or `--from-json` in step 4 as described in
+[Review sources](#review-sources). Commit the generated `review.json` before
+running `check`; CI cannot create evidence for a head that was never
+approved.
 
 ## What it checks
 
@@ -44,6 +69,50 @@ atesto check
 
 Artifacts are excluded from the tree hash, so committing the evidence does not
 invalidate the proof.
+
+## Threat model
+
+Atesto is an evidence checker, not an enforcement point. It records and
+validates claims about a tree; the CI host decides whether a merge is allowed.
+
+**What `proof` proves:** a command ran, exited 0, and its captured output is
+unchanged since the artifact was written for this tree. **What it does not
+prove:** that the command is meaningful, that the tests would catch a bug,
+that the output was not fabricated, or that the environment is reproducible.
+A local `proof.json` is self-reported. Running `test_cmd` in CI is the
+stronger signal; protect that config as described below.
+
+**What `review` proves:** `review.json` is APPROVED, has enough distinct
+reviewers, and is bound to this head and tree; `source` records where the
+review came from. **What it does not prove:** that a human read the diff, that
+the reviewer identity is trustworthy, or that an approval was not copied by
+hand. Manual and JSON reviews are self-reported and unsigned. The GitHub and
+GitLab adapters read the provider's current-head approval through `gh`/`glab`,
+but Atesto never handles provider tokens; the provider API and the local CLI
+decide authenticity.
+
+**Host enforcement:** a nonzero exit from `atesto check` does not block a
+merge. Make the job a required check:
+
+- GitHub: branch protection/rulesets or the merge queue. An admin bypass of a
+  ruleset, or a direct push to an unprotected branch, is outside Atesto's
+  control.
+- GitLab: protected branches and approval rules. An admin bypass or a project
+  configured to merge without approval is outside Atesto's control. Approvals
+  are tied to the MR's current SHA: a new push resets them (depending on the
+  project settings), and the adapter fails if the MR SHA is not the local
+  HEAD. `/approvals` requires a `GITLAB_TOKEN` with `read_api`/`api` scope;
+  `CI_JOB_TOKEN` cannot read it. Atesto never stores the token.
+- Jenkins, CircleCI and Buildkite: the host's required-step, branch-protection
+  or pipeline-permission settings. The snippets only run the gate.
+
+Anyone who can edit the workflow, the container image tag or `atesto.json` can
+replace the gate; keep them in CODEOWNERS and pin images by version, preferably
+by digest. On self-hosted runners, a preinstalled `atesto` earlier on `PATH`
+can shadow the hash-pinned install; the `atesto --version` smoke step only
+catches a different version, not a malicious same-version binary. Do not run
+the gate on runners that untrusted pull requests can modify. Signed
+attestations are not part of 0.3.0.
 
 ## Commands
 
@@ -229,7 +298,7 @@ it. The head may lower it, or add one when the base has none.
 `proof.json` and `review.json` record the producing tool:
 
 ```json
-"tool": { "name": "atesto", "version": "0.2.0" }
+"tool": { "name": "atesto", "version": "0.3.0" }
 ```
 
 The shape is validated when present; artifacts written by older versions
@@ -272,9 +341,9 @@ recorded, so keep secrets out of arguments too).
 - `integrations/github-actions/atesto-gate.yml` is an **optional new workflow**
   outside the Python package. It never edits an existing CI. If you are not
   responsible for the repo's CI, use the local hook and attach the evidence to
-  the PR instead. It pins `atesto==0.2.0` with a sha256, installs with
+  the PR instead. It pins `atesto==0.3.0` with a sha256, installs with
   `--require-hashes --no-deps` on Python 3.12, and runs `atesto --version`
-  before the gate. It becomes runnable once 0.2.0 is published on PyPI.
+  before the gate. It becomes runnable once 0.3.0 is published on PyPI.
 - `integrations/hooks/pre-push` is the reference hook; `atesto hooks install`
   writes the same behavior inline. Both are optional adapters, not core.
 
@@ -282,7 +351,7 @@ recorded, so keep secrets out of arguments too).
 
 `integrations/ci/` contains additive snippets for GitLab, GitHub, Jenkins,
 CircleCI and Buildkite. Each one runs the published container image
-(`ghcr.io/guihirsch/atesto:0.2.0`), fetches full history so `check --ci` can
+(`ghcr.io/guihirsch/atesto:0.3.0`), fetches full history so `check --ci` can
 read the base config, sets the base ref and runs only the gate. The version in
 the snippets must match `pyproject.toml`; `CISnippetTest` fails on drift.
 
@@ -317,10 +386,10 @@ review generation on a machine that has the provider CLI, not in the gate job.
 | Host | Snippet | Full history | Base ref | Gate command |
 | --- | --- | --- | --- | --- |
 | GitLab | `integrations/ci/gitlab-ci.yml` | `GIT_DEPTH: "0"` | `origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME` | `atesto check --ci --base "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"` |
-| GitHub | `integrations/ci/github-actions.yml` | `fetch-depth: 0` | `origin/${{ github.base_ref }}` | `docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo" -w /repo ghcr.io/guihirsch/atesto:0.2.0 check --ci --base "$BASE_REF"` |
-| Jenkins | `integrations/ci/jenkins.Jenkinsfile` | `depth: 0, shallow: false` | `origin/$CHANGE_TARGET` | `docker run --rm --user "$(id -u):$(id -g)" -v "$WORKSPACE:/repo" -w /repo ghcr.io/guihirsch/atesto:0.2.0 check --ci --base "$BASE_REF"` |
-| CircleCI | `integrations/ci/circleci.yml` | `git fetch --unshallow` | `ATESTO_BASE_REF` (default `origin/main`) | `docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo" -w /repo ghcr.io/guihirsch/atesto:0.2.0 check --ci --base "$BASE_REF"` |
-| Buildkite | `integrations/ci/buildkite.yml` | `git fetch --unshallow` | `BUILDKITE_PULL_REQUEST_BASE_BRANCH` (default `main`) | `docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo" -w /repo ghcr.io/guihirsch/atesto:0.2.0 check --ci --base "$BASE_REF"` |
+| GitHub | `integrations/ci/github-actions.yml` | `fetch-depth: 0` | `origin/${{ github.base_ref }}` | `docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo" -w /repo ghcr.io/guihirsch/atesto:0.3.0 check --ci --base "$BASE_REF"` |
+| Jenkins | `integrations/ci/jenkins.Jenkinsfile` | `depth: 0, shallow: false` | `origin/$CHANGE_TARGET` | `docker run --rm --user "$(id -u):$(id -g)" -v "$WORKSPACE:/repo" -w /repo ghcr.io/guihirsch/atesto:0.3.0 check --ci --base "$BASE_REF"` |
+| CircleCI | `integrations/ci/circleci.yml` | `git fetch --unshallow` | `ATESTO_BASE_REF` (default `origin/main`) | `docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo" -w /repo ghcr.io/guihirsch/atesto:0.3.0 check --ci --base "$BASE_REF"` |
+| Buildkite | `integrations/ci/buildkite.yml` | `git fetch --unshallow` | `BUILDKITE_PULL_REQUEST_BASE_BRANCH` (default `main`) | `docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo" -w /repo ghcr.io/guihirsch/atesto:0.3.0 check --ci --base "$BASE_REF"` |
 
 Every snippet is additive: copy it as a new job, workflow or step and leave
 the rest of the pipeline alone. If `docs/atesto/` has more than one slug, add
@@ -344,7 +413,7 @@ so keep the snippet and `atesto.json` in CODEOWNERS.
   consistent and current.
 - A dirty submodule is bound by its HEAD, status and tracked diff. Content of
   untracked files inside the submodule is still not hashed.
-- The CI template pins the published 0.2.0 wheel by sha256. Keep the workflow
+- The CI template pins the published 0.3.0 wheel by sha256. Keep the workflow
   and `atesto.json` in CODEOWNERS; a PR that can edit the workflow can replace
   the gate.
 - `--ci` does not allow a PR to change `test_cmd`, `artifacts_root`,
@@ -354,7 +423,7 @@ so keep the snippet and `atesto.json` in CODEOWNERS.
 
 ## Release
 
-The 0.2.0 wheel is built reproducibly so the CI template can pin a real hash:
+0.3.0 ships a reproducible wheel to PyPI and a matching image to GHCR:
 
 - `[build-system]` stays permissive (`setuptools>=69`) so source builds are
   not tied to the release backend;
@@ -363,21 +432,56 @@ The 0.2.0 wheel is built reproducibly so the CI template can pin a real hash:
   `python -m build --no-isolation`, and sets `SOURCE_DATE_EPOCH=1795651200`
   (2026-11-26T00:00:00Z);
 - a clean checkout built with `umask 022` reproduces
-  `atesto-0.2.0-py3-none-any.whl` byte for byte. File permissions are stored
+  `atesto-0.3.0-py3-none-any.whl` byte for byte. File permissions are stored
   in the wheel zip, so a group-writable checkout (for example `umask 002`)
   changes the hash;
-- the template pins the published wheel:
-  `sha256:b4e5d9c14156986d80aaa1355cb5221fcc6237ceb2d0d71e1f33146196e07e3b`.
+- the gate template is the single source of truth for the release pin:
+  `atesto==0.3.0` with the published wheel sha256. The README does not repeat
+  the hash, so it cannot drift;
+- after the PyPI publish, the `container` job in `release.yml` downloads the
+  published `atesto==0.3.0`, computes its sha256, compares it to the template
+  pin, builds and pushes `ghcr.io/guihirsch/atesto:0.3.0` and `:latest` with
+  that hash, then smokes the image.
+  `.github/workflows/container-publish.yml` remains available for manual
+  dispatch with explicit version and hash inputs.
 
-The CI snippets pin the matching image tag
-(`ghcr.io/guihirsch/atesto:0.2.0`). Bump `pyproject.toml`, the wheel pin, the
-image build arguments and every snippet together: `ReleaseMetadataTest` and
-`CISnippetTest` fail on version drift.
+PyPI and GHCR are updated after the release commit is merged (post-merge).
+The template hash is therefore verified against the published wheel by the
+release workflow; it is not assumed from a local build.
 
-After a release, verify the published artifact directly from PyPI (or from
-the uploaded wheel) instead of trusting a local rebuild. If the pinned build
-environment or timestamp changes, update the template hash in the same
-change.
+Verify a release directly from the published artifacts instead of trusting a
+local rebuild:
+
+```bash
+python -m pip download --no-deps --only-binary=:all: --dest dist \
+  "atesto==0.3.0"
+sha256sum dist/atesto-0.3.0-py3-none-any.whl
+grep -o 'sha256:[0-9a-f]\{64\}' integrations/github-actions/atesto-gate.yml
+# The published wheel hash and the template pin must match.
+
+docker pull ghcr.io/guihirsch/atesto:0.3.0
+docker run --rm ghcr.io/guihirsch/atesto:0.3.0 --version
+docker image inspect \
+  --format '{{ index .Config.Labels "dev.atesto.wheel-sha256" }}' \
+  ghcr.io/guihirsch/atesto:0.3.0
+# The image label must match the wheel hash; record the digest printed by pull.
+```
+
+Rebuild the wheel from a clean checkout and compare before changing the pin:
+
+```bash
+umask 022
+git clone --no-hardlinks <repo> atesto-rebuild
+cd atesto-rebuild
+python -m pip install "build==1.6.1" "setuptools==84.2.1" "wheel==0.48.0"
+SOURCE_DATE_EPOCH=1795651200 python -m build --no-isolation
+sha256sum dist/atesto-0.3.0-py3-none-any.whl
+```
+
+Bump `pyproject.toml`/`VERSION`, the wheel pin, the image build arguments and
+every snippet together: `ReleaseMetadataTest`, `ContainerMetadataTest` and
+`CISnippetTest` fail on version drift. If the pinned build environment or
+timestamp changes, update the template hash in the same change.
 
 ## Development
 

@@ -47,5 +47,6 @@ jobs:
             .github/workflows/atesto.yml \
             .github/workflows/container.yml \
             .github/workflows/container-publish.yml \
+            .github/workflows/release.yml \
             integrations/github-actions/atesto-gate.yml \
             integrations/ci/github-actions.yml
