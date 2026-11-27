@@ -1,0 +1,30 @@
+name: container
+
+on:
+  push:
+    paths:
+      - Dockerfile
+      - .github/workflows/container.yml
+      - .github/workflows/container-publish.yml
+      - tests/container-smoke.sh
+  pull_request:
+    paths:
+      - Dockerfile
+      - .github/workflows/container.yml
+      - .github/workflows/container-publish.yml
+      - tests/container-smoke.sh
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build image
+        run: docker build --tag atesto:smoke .
+      - name: Smoke test
+        run: bash tests/container-smoke.sh atesto:smoke 0.2.0
