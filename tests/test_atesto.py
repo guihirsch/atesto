@@ -12,6 +12,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import ClassVar
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -4124,6 +4125,121 @@ class ContainerMetadataTest(unittest.TestCase):
         ):
             with self.subTest(needle=needle):
                 self.assertIn(needle, self.smoke)
+
+
+class CISnippetTest(unittest.TestCase):
+    """CI snippets must run the same pinned container gate on every host."""
+
+    SNIPPETS: ClassVar[dict[str, dict[str, list[str] | str]]] = {
+        "gitlab-ci.yml": {
+            "history": ['GIT_DEPTH: "0"'],
+            "base": "CI_MERGE_REQUEST_TARGET_BRANCH_NAME",
+        },
+        "github-actions.yml": {
+            "history": ["fetch-depth: 0"],
+            "base": "github.base_ref",
+        },
+        "jenkins.Jenkinsfile": {
+            "history": ["depth: 0", "shallow: false"],
+            "base": "CHANGE_TARGET",
+        },
+        "circleci.yml": {
+            "history": ["--unshallow"],
+            "base": "ATESTO_BASE_REF",
+        },
+        "buildkite.yml": {
+            "history": ["--unshallow"],
+            "base": "BUILDKITE_PULL_REQUEST_BASE_BRANCH",
+        },
+    }
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.version = package_version()
+        directory = ROOT / "integrations" / "ci"
+        cls.directory = directory
+        cls.text = {
+            name: (directory / name).read_text(encoding="utf-8")
+            for name in cls.SNIPPETS
+        }
+
+    def test_every_host_has_a_snippet(self) -> None:
+        self.assertTrue(self.directory.is_dir())
+        found = {
+            item.name
+            for item in self.directory.iterdir()
+            if item.is_file()
+        }
+        self.assertLessEqual(set(self.SNIPPETS), found)
+
+    def test_snippets_pin_the_package_version(self) -> None:
+        expected = f"ghcr.io/guihirsch/atesto:{self.version}"
+        for name, text in self.text.items():
+            with self.subTest(snippet=name):
+                self.assertIn(expected, text)
+                tags = re.findall(
+                    r"ghcr\.io/guihirsch/atesto:([A-Za-z0-9._-]+)", text
+                )
+                self.assertTrue(tags, name)
+                self.assertEqual(set(tags), {self.version}, name)
+
+    def test_snippets_fetch_full_history(self) -> None:
+        for name, spec in self.SNIPPETS.items():
+            for token in spec["history"]:
+                with self.subTest(snippet=name, token=token):
+                    self.assertIn(token, self.text[name])
+
+    def test_snippets_set_base_ref_and_run_gate(self) -> None:
+        for name, spec in self.SNIPPETS.items():
+            text = self.text[name]
+            with self.subTest(snippet=name):
+                self.assertIn("check --ci", text)
+                self.assertIn("--base", text)
+                self.assertIn(spec["base"], text)
+
+    def test_snippets_are_additive_and_do_not_write_evidence(self) -> None:
+        # The review artifact must be part of the PR diff before CI runs.
+        # A snippet that generates or pushes evidence would either fail
+        # `check --ci` or mutate the reviewed branch.
+        for name, text in self.text.items():
+            for forbidden in (
+                "review --from-",
+                "atesto review",
+                "git commit",
+                "git push",
+                "docker push",
+            ):
+                with self.subTest(snippet=name, forbidden=forbidden):
+                    self.assertNotIn(forbidden, text)
+
+    def test_readme_documents_host_matrix_and_precommit_review(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        hosts = ("GitLab", "GitHub", "Jenkins", "CircleCI", "Buildkite")
+        rows = [
+            line
+            for line in readme.splitlines()
+            if line.startswith("|") and any(host in line for host in hosts)
+        ]
+        self.assertEqual(len(rows), len(hosts), rows)
+        for host, row in zip(hosts, rows):
+            with self.subTest(host=host):
+                self.assertIn(host, row)
+                self.assertIn("check --ci", row)
+        self.assertIn(
+            f"ghcr.io/guihirsch/atesto:{self.version}", readme
+        )
+        for source in (
+            "--from-github-pr",
+            "--from-gitlab-mr",
+            "--from-json",
+        ):
+            with self.subTest(source=source):
+                self.assertIn(source, readme)
+        self.assertIn("pre-commit", readme)
+        self.assertRegex(readme, r"(?i)part of the (?:pr|merge request) diff")
+        for phrase in ("branch protection", "rulesets", "merge queue"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, readme)
 
 
 if __name__ == "__main__":
