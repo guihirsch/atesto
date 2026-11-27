@@ -2183,5 +2183,120 @@ class ReleaseMetadataTest(unittest.TestCase):
         )
 
 
+class ContainerMetadataTest(unittest.TestCase):
+    """The container image must match the ticket #13 contract."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        cls.ci = (
+            ROOT / ".github" / "workflows" / "container.yml"
+        ).read_text(encoding="utf-8")
+        cls.publish = (
+            ROOT / ".github" / "workflows" / "container-publish.yml"
+        ).read_text(encoding="utf-8")
+        cls.gate = (
+            ROOT / "integrations" / "github-actions" / "atesto-gate.yml"
+        ).read_text(encoding="utf-8")
+        cls.smoke_path = ROOT / "tests" / "container-smoke.sh"
+        cls.smoke = cls.smoke_path.read_text(encoding="utf-8")
+        release = re.search(
+            r"atesto==([0-9]+\.[0-9]+\.[0-9]+) "
+            r"--hash=sha256:([0-9a-f]{64})",
+            cls.gate,
+        )
+        if release is None:
+            raise AssertionError("gate template nao pina o wheel")
+        cls.release_version, cls.release_sha256 = release.groups()
+
+    def test_base_image_is_pinned_python_312_slim(self) -> None:
+        self.assertRegex(
+            self.dockerfile,
+            r"(?m)^FROM python:3\.12-slim@sha256:[0-9a-f]{64}$",
+        )
+
+    def test_installs_git_and_the_hashed_release_wheel(self) -> None:
+        self.assertIn(
+            "apt-get install -y --no-install-recommends git", self.dockerfile
+        )
+        self.assertIn("--require-hashes", self.dockerfile)
+        self.assertIn("--no-deps", self.dockerfile)
+        self.assertIn(
+            f"ARG ATESTO_VERSION={self.release_version}", self.dockerfile
+        )
+        self.assertIn(
+            f"ARG ATESTO_SHA256={self.release_sha256}", self.dockerfile
+        )
+
+    def test_runs_as_non_root_in_repo_with_atesto_entrypoint(self) -> None:
+        self.assertRegex(self.dockerfile, r"(?m)^USER atesto$")
+        self.assertNotRegex(self.dockerfile, r"(?m)^USER (?:root|0)$")
+        self.assertRegex(self.dockerfile, r"(?m)^WORKDIR /repo$")
+        self.assertRegex(
+            self.dockerfile, r'(?m)^ENTRYPOINT \["atesto"\]$'
+        )
+
+    def test_does_not_install_provider_clis(self) -> None:
+        for cli in ("gh", "glab"):
+            with self.subTest(cli=cli):
+                self.assertNotRegex(
+                    self.dockerfile,
+                    rf"(?m)^.*apt-get install[^\n]*\b{cli}\b",
+                )
+
+    def test_ci_builds_and_smokes_on_container_changes(self) -> None:
+        for trigger in ("push:", "pull_request:"):
+            with self.subTest(trigger=trigger):
+                self.assertIn(trigger, self.ci)
+        for path in (
+            "Dockerfile",
+            ".github/workflows/container.yml",
+            ".github/workflows/container-publish.yml",
+            "tests/container-smoke.sh",
+        ):
+            with self.subTest(path=path):
+                self.assertIn(f"- {path}", self.ci)
+        self.assertIn("docker build", self.ci)
+        self.assertIn(
+            f"tests/container-smoke.sh atesto:smoke {self.release_version}",
+            self.ci,
+        )
+
+    def test_publish_pushes_version_and_latest_with_release_args(self) -> None:
+        self.assertIn("workflow_dispatch:", self.publish)
+        self.assertIn("packages: write", self.publish)
+        self.assertIn(
+            f'default: "{self.release_version}"', self.publish
+        )
+        self.assertIn(
+            f'default: "{self.release_sha256}"', self.publish
+        )
+        self.assertIn(
+            "ATESTO_VERSION=${{ inputs.version }}", self.publish
+        )
+        self.assertIn(
+            "ATESTO_SHA256=${{ inputs.wheel_sha256 }}", self.publish
+        )
+        self.assertIn(
+            "ghcr.io/guihirsch/atesto:${{ inputs.version }}", self.publish
+        )
+        self.assertIn("ghcr.io/guihirsch/atesto:latest", self.publish)
+
+    def test_smoke_checks_version_user_provider_clis_and_gate(self) -> None:
+        self.assertTrue(os.access(self.smoke_path, os.X_OK))
+        for needle in (
+            "--version",
+            "id -u",
+            "gh",
+            "glab",
+            "atesto: ok",
+            "init",
+            "proof",
+            "check",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, self.smoke)
+
+
 if __name__ == "__main__":
     unittest.main()
