@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -29,11 +30,15 @@ def package_version() -> str:
     return match.group(1)
 
 
-def cli(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def cli(
+    repo: Path,
+    *args: str,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-m", "atesto", *args],
         cwd=repo,
-        env=ENV,
+        env={**ENV, **(env or {})},
         text=True,
         capture_output=True,
         check=False,
@@ -91,6 +96,121 @@ def proof(repo: Path, *, command: str = "print('ok')") -> None:
 def commit(repo: Path, message: str = "evidence") -> None:
     git(repo, "add", ".")
     git(repo, "commit", "-qm", message)
+
+
+FAKE_GH_SCRIPT = """\
+#!{python}
+import json
+import os
+import sys
+
+with open(os.environ["FAKE_PROVIDER_SCENARIO"], encoding="utf-8") as handle:
+    scenario = json.load(handle)
+args = sys.argv[1:]
+with open(os.environ["FAKE_PROVIDER_LOG"], "a", encoding="utf-8") as log:
+    log.write(
+        json.dumps(
+            {{
+                "args": args,
+                "GH_REPO": os.environ.get("GH_REPO"),
+                "cwd": os.getcwd(),
+            }}
+        )
+    )
+    log.write("\\n")
+if args[:2] == ["pr", "view"]:
+    key = "pr_view"
+elif args[:1] == ["api"]:
+    key = "api"
+else:
+    sys.stderr.write("fake gh: comando inesperado: " + " ".join(args) + "\\n")
+    raise SystemExit(97)
+payload = scenario[key]
+exit_code = payload.get("exit", 0)
+if exit_code:
+    sys.stdout.write(payload.get("stdout", ""))
+    sys.stderr.write(payload.get("stderr", ""))
+    raise SystemExit(exit_code)
+if "stdout" in payload:
+    sys.stdout.write(payload["stdout"])
+else:
+    json.dump(payload.get("json"), sys.stdout)
+"""
+
+
+def fake_provider_cli(
+    tmp: str, name: str, script: str, scenario: dict
+) -> dict[str, str]:
+    """Instala um CLI falso no PATH e retorna o env para o CLI do Atesto."""
+    bin_dir = Path(tmp) / f"fake-{name}-bin"
+    bin_dir.mkdir(exist_ok=True)
+    executable = bin_dir / name
+    executable.write_text(script, encoding="utf-8")
+    executable.chmod(0o755)
+    scenario_path = Path(tmp) / f"fake-{name}-scenario.json"
+    scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+    log_path = Path(tmp) / f"fake-{name}.log"
+    path = os.environ.get("PATH", "")
+    return {
+        "PATH": f"{bin_dir}{os.pathsep}{path}",
+        "FAKE_PROVIDER_SCENARIO": str(scenario_path),
+        "FAKE_PROVIDER_LOG": str(log_path),
+    }
+
+
+def fake_gh(tmp: str, *, pr_view: dict, api: dict) -> dict[str, str]:
+    return fake_provider_cli(
+        tmp,
+        "gh",
+        FAKE_GH_SCRIPT.format(python=sys.executable),
+        {"pr_view": pr_view, "api": api},
+    )
+
+
+def provider_calls(tmp: str, name: str) -> list[dict[str, object]]:
+    log_path = Path(tmp) / f"fake-{name}.log"
+    if not log_path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def gh_calls(tmp: str) -> list[dict[str, object]]:
+    return provider_calls(tmp, "gh")
+
+
+def github_pr(head: str, url: str, **fields: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "number": 42,
+        "url": url,
+        "headRefOid": head,
+        "reviewDecision": "APPROVED",
+    }
+    payload.update(fields)
+    return {"json": payload}
+
+
+def github_review(
+    review_id: int,
+    login: str,
+    state: str,
+    commit_id: str | None,
+    submitted_at: str,
+) -> dict[str, object]:
+    return {
+        "id": review_id,
+        "user": {"login": login, "type": "User"},
+        "state": state,
+        "commit_id": commit_id,
+        "submitted_at": submitted_at,
+    }
+
+
+def github_reviews(*pages: list[dict[str, object]]) -> dict[str, object]:
+    return {"json": list(pages)}
 
 
 class AtestoTest(unittest.TestCase):
@@ -2403,6 +2523,636 @@ class ReviewFromJsonTest(unittest.TestCase):
                         / "review.json"
                     ).exists()
                 )
+
+
+class ReviewFromGithubTest(unittest.TestCase):
+    def test_from_github_writes_source_and_bound_head(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof,review")
+            proof(repo)
+            commit(repo)
+            head = git(repo, "rev-parse", "HEAD")
+            url = "https://github.com/acme/repo/pull/42"
+            env = fake_gh(
+                tmp,
+                pr_view=github_pr(head, url),
+                api=github_reviews(
+                    [
+                        github_review(
+                            1, "alice", "APPROVED", head, "2026-11-27T10:00:00Z"
+                        ),
+                        github_review(
+                            2, "bob", "COMMENTED", head, "2026-11-27T10:01:00Z"
+                        ),
+                    ]
+                ),
+            )
+            result = cli(
+                repo, "review", "demo", "--from-github-pr", "42", env=env
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            artifact = json.loads(
+                (
+                    repo / "docs" / "atesto" / "demo" / "review.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(artifact["source"], {"kind": "github", "ref": url})
+            self.assertEqual(artifact["head"], head)
+            self.assertEqual(artifact["verdict"], "APPROVED")
+            self.assertEqual(artifact["reviewers"], ["alice"])
+            self.assertTrue(artifact["intent"].strip())
+            commit(repo, "review")
+            checked = cli(repo, "check", "--json")
+            self.assertEqual(
+                checked.returncode, 0, checked.stdout + checked.stderr
+            )
+            payload = json.loads(checked.stdout)
+            self.assertEqual(
+                payload["review"]["source"], {"kind": "github", "ref": url}
+            )
+
+    def test_from_github_ignores_approval_on_older_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            old = git(repo, "rev-parse", "HEAD")
+            (repo / "app.py").write_text("x = 2\n", encoding="utf-8")
+            commit(repo, "code")
+            head = git(repo, "rev-parse", "HEAD")
+            env = fake_gh(
+                tmp,
+                pr_view=github_pr(head, "https://github.com/acme/repo/pull/7"),
+                api=github_reviews(
+                    [
+                        github_review(
+                            1, "alice", "APPROVED", old, "2026-11-27T10:00:00Z"
+                        )
+                    ]
+                ),
+            )
+            result = cli(
+                repo, "review", "demo", "--from-github-pr", "7", env=env
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "aprovacao", (result.stdout + result.stderr).lower()
+            )
+            self.assertFalse(
+                (repo / "docs" / "atesto" / "demo" / "review.json").exists()
+            )
+
+    def test_from_github_uses_effective_latest_review_per_login(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            old = git(repo, "rev-parse", "HEAD")
+            (repo / "app.py").write_text("x = 2\n", encoding="utf-8")
+            commit(repo, "code")
+            head = git(repo, "rev-parse", "HEAD")
+            env = fake_gh(
+                tmp,
+                pr_view=github_pr(head, "https://github.com/acme/repo/pull/8"),
+                api=github_reviews(
+                    [
+                        github_review(
+                            1, "alice", "APPROVED", old, "2026-11-27T10:00:00Z"
+                        ),
+                        github_review(
+                            2, "alice", "APPROVED", head, "2026-11-27T10:02:00Z"
+                        ),
+                    ],
+                    [
+                        github_review(
+                            3,
+                            "bob",
+                            "CHANGES_REQUESTED",
+                            old,
+                            "2026-11-27T10:01:00Z",
+                        ),
+                        github_review(
+                            4, "bob", "APPROVED", head, "2026-11-27T10:03:00Z"
+                        ),
+                        github_review(
+                            5, "carol", "APPROVED", head, "2026-11-27T10:04:00Z"
+                        ),
+                        github_review(
+                            6, "carol", "COMMENTED", head, "2026-11-27T10:05:00Z"
+                        ),
+                    ],
+                ),
+            )
+            result = cli(
+                repo, "review", "demo", "--from-github-pr", "8", env=env
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            artifact = json.loads(
+                (
+                    repo / "docs" / "atesto" / "demo" / "review.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(artifact["reviewers"], ["alice", "bob", "carol"])
+            calls = [
+                call for call in gh_calls(tmp) if call["args"][:1] == ["api"]
+            ]
+            self.assertEqual(len(calls), 1)
+            self.assertIn("--paginate", calls[0]["args"])
+            self.assertIn("--slurp", calls[0]["args"])
+            self.assertIn(
+                "repos/{owner}/{repo}/pulls/8/reviews", calls[0]["args"]
+            )
+
+    def test_from_github_changes_requested_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            head = git(repo, "rev-parse", "HEAD")
+            env = fake_gh(
+                tmp,
+                pr_view=github_pr(head, "https://github.com/acme/repo/pull/9"),
+                api=github_reviews(
+                    [
+                        github_review(
+                            1, "alice", "APPROVED", head, "2026-11-27T10:00:00Z"
+                        ),
+                        github_review(
+                            2,
+                            "bob",
+                            "CHANGES_REQUESTED",
+                            head,
+                            "2026-11-27T10:01:00Z",
+                        ),
+                    ]
+                ),
+            )
+            result = cli(
+                repo, "review", "demo", "--from-github-pr", "9", env=env
+            )
+            self.assertNotEqual(result.returncode, 0)
+            output = (result.stdout + result.stderr).lower()
+            self.assertIn("changes requested", output)
+            self.assertIn("bob", output)
+            self.assertFalse(
+                (repo / "docs" / "atesto" / "demo" / "review.json").exists()
+            )
+
+    def test_from_github_review_decision_fails_closed(self) -> None:
+        for decision in ("CHANGES_REQUESTED", "REVIEW_REQUIRED"):
+            with (
+                self.subTest(decision=decision),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                repo = make_repo(tmp)
+                init(repo)
+                head = git(repo, "rev-parse", "HEAD")
+                env = fake_gh(
+                    tmp,
+                    pr_view=github_pr(
+                        head,
+                        "https://github.com/acme/repo/pull/10",
+                        reviewDecision=decision,
+                    ),
+                    api=github_reviews(
+                        [
+                            github_review(
+                                1,
+                                "alice",
+                                "APPROVED",
+                                head,
+                                "2026-11-27T10:00:00Z",
+                            )
+                        ]
+                    ),
+                )
+                result = cli(
+                    repo, "review", "demo", "--from-github-pr", "10", env=env
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(
+                    (
+                        repo / "docs" / "atesto" / "demo" / "review.json"
+                    ).exists()
+                )
+
+    def test_from_github_empty_review_decision_is_not_a_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            head = git(repo, "rev-parse", "HEAD")
+            env = fake_gh(
+                tmp,
+                pr_view=github_pr(
+                    head,
+                    "https://github.com/acme/repo/pull/11",
+                    reviewDecision="",
+                ),
+                api=github_reviews(
+                    [
+                        github_review(
+                            1, "alice", "APPROVED", head, "2026-11-27T10:00:00Z"
+                        )
+                    ]
+                ),
+            )
+            result = cli(
+                repo, "review", "demo", "--from-github-pr", "11", env=env
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_from_github_requires_current_head_approval(self) -> None:
+        cases = {
+            "no reviews": [],
+            "dismissed": [
+                github_review(
+                    1, "alice", "APPROVED", None, "2026-11-27T10:00:00Z"
+                ),
+                github_review(
+                    2, "alice", "DISMISSED", None, "2026-11-27T10:01:00Z"
+                ),
+            ],
+        }
+        for name, reviews in cases.items():
+            with (
+                self.subTest(case=name),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                repo = make_repo(tmp)
+                init(repo)
+                head = git(repo, "rev-parse", "HEAD")
+                for index, review in enumerate(reviews):
+                    review["commit_id"] = head
+                env = fake_gh(
+                    tmp,
+                    pr_view=github_pr(
+                        head, "https://github.com/acme/repo/pull/12"
+                    ),
+                    api=github_reviews(reviews),
+                )
+                result = cli(
+                    repo, "review", "demo", "--from-github-pr", "12", env=env
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "aprovacao", (result.stdout + result.stderr).lower()
+                )
+                self.assertFalse(
+                    (
+                        repo / "docs" / "atesto" / "demo" / "review.json"
+                    ).exists()
+                )
+
+    def test_from_github_missing_cli_fails_with_actionable_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            bin_dir = Path(tmp) / "bin"
+            bin_dir.mkdir()
+            git_binary = shutil.which("git")
+            self.assertIsNotNone(git_binary)
+            (bin_dir / "git").symlink_to(git_binary)
+            result = cli(
+                repo,
+                "review",
+                "demo",
+                "--from-github-pr",
+                "13",
+                env={"PATH": str(bin_dir)},
+            )
+            self.assertNotEqual(result.returncode, 0)
+            output = (result.stdout + result.stderr).lower()
+            self.assertIn("gh", output)
+            self.assertIn("nao encontrado", output)
+            self.assertIn("instale", output)
+            self.assertFalse(
+                (repo / "docs" / "atesto" / "demo" / "review.json").exists()
+            )
+
+    def test_from_github_unauthenticated_fails_with_actionable_message(
+        self,
+    ) -> None:
+        cases = [
+            {
+                "exit": 4,
+                "stderr": (
+                    "To get started with GitHub CLI, please run:  "
+                    "gh auth login\n"
+                ),
+            },
+            {
+                "exit": 1,
+                "stderr": (
+                    "gh: To use GitHub CLI in a GitHub Actions workflow, "
+                    "set the GH_TOKEN environment variable.\n"
+                ),
+            },
+        ]
+        for payload in cases:
+            with (
+                self.subTest(stderr=payload["stderr"]),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                repo = make_repo(tmp)
+                init(repo)
+                env = fake_gh(
+                    tmp, pr_view=payload, api={"json": []}
+                )
+                result = cli(
+                    repo, "review", "demo", "--from-github-pr", "14", env=env
+                )
+                self.assertNotEqual(result.returncode, 0)
+                output = (result.stdout + result.stderr).lower()
+                self.assertIn("nao autenticado", output)
+                self.assertIn("gh auth login", output)
+                self.assertFalse(
+                    (
+                        repo / "docs" / "atesto" / "demo" / "review.json"
+                    ).exists()
+                )
+
+    def test_from_github_malformed_output_fails_closed(self) -> None:
+        cases: list[tuple[str, dict | None, dict, str]] = [
+            ("metadata not json", None, {"json": []}, "malformado"),
+            (
+                "reviews not pages",
+                {},
+                {"json": {"message": "Not Found"}},
+                "paginas",
+            ),
+            (
+                "review without user",
+                {},
+                {"json": [[{"state": "APPROVED"}]]},
+                "user.login",
+            ),
+            (
+                "review bad state",
+                {},
+                {"json": [[{"user": {"login": "a"}, "state": "MAYBE"}]]},
+                "state",
+            ),
+        ]
+        for name, metadata, api, expected in cases:
+            with (
+                self.subTest(case=name),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                repo = make_repo(tmp)
+                init(repo)
+                head = git(repo, "rev-parse", "HEAD")
+                pr_view = (
+                    {"stdout": "{not json"}
+                    if metadata is None
+                    else {"json": {"headRefOid": head, "url": "u"}}
+                )
+                env = fake_gh(tmp, pr_view=pr_view, api=api)
+                result = cli(
+                    repo, "review", "demo", "--from-github-pr", "15", env=env
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    expected, (result.stdout + result.stderr).lower()
+                )
+                self.assertFalse(
+                    (
+                        repo / "docs" / "atesto" / "demo" / "review.json"
+                    ).exists()
+                )
+
+    def test_from_github_rejects_invalid_commit_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            head = git(repo, "rev-parse", "HEAD")
+            env = fake_gh(
+                tmp,
+                pr_view={"json": {"headRefOid": "a" * 41, "url": "u"}},
+                api={"json": []},
+            )
+            result = cli(
+                repo, "review", "demo", "--from-github-pr", "22", env=env
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("headRefOid", result.stdout + result.stderr)
+            self.assertFalse(
+                (repo / "docs" / "atesto" / "demo" / "review.json").exists()
+            )
+
+            env = fake_gh(
+                tmp,
+                pr_view=github_pr(
+                    head, "https://github.com/acme/repo/pull/22"
+                ),
+                api=github_reviews(
+                    [
+                        github_review(
+                            1,
+                            "alice",
+                            "APPROVED",
+                            "b" * 41,
+                            "2026-11-27T10:00:00Z",
+                        )
+                    ]
+                ),
+            )
+            result = cli(
+                repo, "review", "demo", "--from-github-pr", "22", env=env
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("commit_id", result.stdout + result.stderr)
+            self.assertFalse(
+                (repo / "docs" / "atesto" / "demo" / "review.json").exists()
+            )
+
+    def test_from_github_rest_404_checks_exit_before_stdout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            head = git(repo, "rev-parse", "HEAD")
+            env = fake_gh(
+                tmp,
+                pr_view=github_pr(
+                    head, "https://github.com/acme/repo/pull/16"
+                ),
+                api={
+                    "exit": 1,
+                    "stdout": '{"message":"Not Found","status":"404"}',
+                    "stderr": "gh: Not Found (HTTP 404)\n",
+                },
+            )
+            result = cli(
+                repo, "review", "demo", "--from-github-pr", "16", env=env
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("404", result.stdout + result.stderr)
+            self.assertFalse(
+                (repo / "docs" / "atesto" / "demo" / "review.json").exists()
+            )
+
+    def test_from_github_requires_local_head_to_match_pr_head(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            old = git(repo, "rev-parse", "HEAD")
+            (repo / "app.py").write_text("x = 2\n", encoding="utf-8")
+            commit(repo, "code")
+            env = fake_gh(
+                tmp,
+                pr_view=github_pr(
+                    old, "https://github.com/acme/repo/pull/17"
+                ),
+                api=github_reviews([]),
+            )
+            result = cli(
+                repo, "review", "demo", "--from-github-pr", "17", env=env
+            )
+            self.assertNotEqual(result.returncode, 0)
+            output = (result.stdout + result.stderr).lower()
+            self.assertIn("head", output)
+            self.assertIn("checkout", output)
+            self.assertFalse(
+                (repo / "docs" / "atesto" / "demo" / "review.json").exists()
+            )
+
+    def test_from_github_rejects_manual_flags_and_other_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            head = git(repo, "rev-parse", "HEAD")
+            path = approval_json(tmp, head)
+            for extra in (
+                ["--head", "HEAD"],
+                ["--verdict", "APPROVED"],
+                ["--reviewer", "alice"],
+                ["--intent", "manual"],
+                ["--from-json", str(path)],
+            ):
+                with self.subTest(extra=extra):
+                    result = cli(
+                        repo,
+                        "review",
+                        "demo",
+                        "--from-github-pr",
+                        "18",
+                        *extra,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    output = (result.stdout + result.stderr).lower()
+                    self.assertTrue(
+                        "nao combina" in output or "apenas uma fonte" in output
+                    )
+                    self.assertFalse(
+                        (
+                            repo
+                            / "docs"
+                            / "atesto"
+                            / "demo"
+                            / "review.json"
+                        ).exists()
+                    )
+
+    def test_from_github_keeps_min_reviewers_for_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof,review")
+            config_path = repo / "atesto.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["min_reviewers"] = 2
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            proof(repo)
+            commit(repo)
+            head = git(repo, "rev-parse", "HEAD")
+            env = fake_gh(
+                tmp,
+                pr_view=github_pr(
+                    head, "https://github.com/acme/repo/pull/19"
+                ),
+                api=github_reviews(
+                    [
+                        github_review(
+                            1, "alice", "APPROVED", head, "2026-11-27T10:00:00Z"
+                        )
+                    ]
+                ),
+            )
+            result = cli(
+                repo, "review", "demo", "--from-github-pr", "19", env=env
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            commit(repo, "review")
+            checked = cli(repo, "check")
+            self.assertEqual(checked.returncode, 1)
+            self.assertIn("pelo menos 2", checked.stdout)
+
+    def test_from_github_leaves_repo_resolution_to_gh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            head = git(repo, "rev-parse", "HEAD")
+            url = "https://github.com/upstream/repo/pull/20"
+            env = fake_gh(
+                tmp,
+                pr_view=github_pr(head, url),
+                api=github_reviews(
+                    [
+                        github_review(
+                            1, "alice", "APPROVED", head, "2026-11-27T10:00:00Z"
+                        )
+                    ]
+                ),
+            )
+            env["GH_REPO"] = "upstream/repo"
+            result = cli(
+                repo, "review", "demo", "--from-github-pr", "20", env=env
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            calls = gh_calls(tmp)
+            self.assertEqual(
+                {call["GH_REPO"] for call in calls}, {"upstream/repo"}
+            )
+            api_calls = [
+                call for call in calls if call["args"][:1] == ["api"]
+            ]
+            self.assertEqual(len(api_calls), 1)
+            self.assertIn(
+                "repos/{owner}/{repo}/pulls/20/reviews",
+                api_calls[0]["args"],
+            )
+
+    def test_from_github_runs_gh_from_the_review_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            head = git(repo, "rev-parse", "HEAD")
+            elsewhere = Path(tmp) / "elsewhere"
+            elsewhere.mkdir()
+            env = fake_gh(
+                tmp,
+                pr_view=github_pr(
+                    head, "https://github.com/acme/repo/pull/21"
+                ),
+                api=github_reviews(
+                    [
+                        github_review(
+                            1, "alice", "APPROVED", head, "2026-11-27T10:00:00Z"
+                        )
+                    ]
+                ),
+            )
+            result = cli(
+                elsewhere,
+                "review",
+                "demo",
+                "--root",
+                str(repo),
+                "--from-github-pr",
+                "21",
+                env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(
+                {call["cwd"] for call in gh_calls(tmp)},
+                {str(repo.resolve())},
+            )
 
 
 class ReviewSchemaTest(unittest.TestCase):

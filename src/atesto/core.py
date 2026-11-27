@@ -1422,6 +1422,273 @@ def write_review_from_json(root: Path, slug: str, path: Path) -> Path:
     )
 
 
+class ProviderError(AtestoError):
+    """Falha ao ler um provedor externo (gh/glab)."""
+
+
+PROVIDER_AUTH_HINTS = {
+    "gh": "rode `gh auth login` ou defina GH_TOKEN",
+    "glab": "rode `glab auth login` ou defina GITLAB_TOKEN",
+}
+PROVIDER_AUTH_MARKERS = (
+    "not authenticated",
+    "authentication required",
+    "bad credentials",
+    "to get started with github cli",
+    "gh auth login",
+    "glab auth login",
+    "gh_token",
+    "github_token",
+    "gitlab_token",
+    "oauth_token",
+)
+GITHUB_REVIEW_STATES = frozenset(
+    {"APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING"}
+)
+GITHUB_REVIEW_DECISIONS = frozenset(
+    {"", "APPROVED", "CHANGES_REQUESTED", "REVIEW_REQUIRED"}
+)
+GITHUB_OID_PATTERN = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+
+
+def _provider_not_found(command: str) -> ProviderError:
+    hint = PROVIDER_AUTH_HINTS.get(command, f"rode `{command} auth login`")
+    return ProviderError(
+        f"{command} nao encontrado no PATH; instale o CLI e {hint}"
+    )
+
+
+def run_provider_command(
+    command: str, args: list[str], *, cwd: Path | None = None
+) -> str:
+    """Executa um CLI de provedor e devolve stdout.
+
+    O exit code e checado antes de qualquer parse: `gh api` e `glab api`
+    escrevem um corpo JSON de erro em stdout mesmo quando falham.
+    """
+    try:
+        result = subprocess.run(
+            [command, *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            errors="surrogateescape",
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise _provider_not_found(command) from exc
+    except OSError as exc:
+        raise ProviderError(f"{command} nao iniciou: {exc}") from exc
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        stdout = result.stdout.strip()
+        message = stderr or stdout
+        lowered = f"{stderr}\n{stdout}".lower()
+        if result.returncode == 4 or any(
+            marker in lowered for marker in PROVIDER_AUTH_MARKERS
+        ):
+            hint = PROVIDER_AUTH_HINTS.get(
+                command, f"rode `{command} auth login`"
+            )
+            raise ProviderError(f"{command} nao autenticado; {hint}")
+        raise ProviderError(
+            f"{command} falhou (exit {result.returncode}): "
+            + (message or "sem mensagem")
+        )
+    return result.stdout
+
+
+def provider_json(
+    command: str,
+    args: list[str],
+    label: str,
+    *,
+    cwd: Path | None = None,
+) -> Any:
+    output = run_provider_command(command, args, cwd=cwd)
+    try:
+        return json.loads(output)
+    except ValueError as exc:
+        raise ProviderError(
+            f"{command} retornou {label} malformado: esperava JSON"
+        ) from exc
+
+
+@dataclass(frozen=True)
+class GithubReview:
+    login: str
+    state: str
+    commit_id: str | None
+    submitted_at: str
+    review_id: int
+
+
+def _provider_error(label: str, message: str) -> ProviderError:
+    return ProviderError(f"{label}: {message}")
+
+
+def _github_metadata(root: Path, pr_number: int) -> tuple[str, str, str]:
+    label = f"PR #{pr_number}"
+    data = provider_json(
+        "gh",
+        [
+            "pr",
+            "view",
+            str(pr_number),
+            "--json",
+            "url,headRefOid,reviewDecision",
+        ],
+        f"metadados do {label}",
+        cwd=root,
+    )
+    if not isinstance(data, dict):
+        raise _provider_error(label, "metadados precisam ser objeto JSON")
+    head = data.get("headRefOid")
+    if not isinstance(head, str) or not GITHUB_OID_PATTERN.fullmatch(
+        head.strip().lower()
+    ):
+        raise _provider_error(label, "headRefOid invalido")
+    url = data.get("url")
+    if not isinstance(url, str) or not url.strip():
+        raise _provider_error(label, "url invalida")
+    decision = data.get("reviewDecision")
+    if decision is None:
+        decision = ""
+    if not isinstance(decision, str) or decision not in GITHUB_REVIEW_DECISIONS:
+        raise _provider_error(
+            label, f"reviewDecision invalido: {decision!r}"
+        )
+    return head.strip().lower(), url.strip(), decision
+
+
+def _github_reviews(root: Path, pr_number: int) -> list[GithubReview]:
+    label = f"PR #{pr_number}"
+    raw = provider_json(
+        "gh",
+        [
+            "api",
+            "--paginate",
+            "--slurp",
+            f"repos/{{owner}}/{{repo}}/pulls/{pr_number}/reviews",
+        ],
+        f"reviews do {label}",
+        cwd=root,
+    )
+    if not isinstance(raw, list) or not all(
+        isinstance(page, list) for page in raw
+    ):
+        raise _provider_error(
+            label, "reviews precisam ser lista de paginas JSON"
+        )
+    reviews: list[GithubReview] = []
+    for page in raw:
+        for item in page:
+            if not isinstance(item, dict):
+                raise _provider_error(label, "review precisa ser objeto")
+            user = item.get("user")
+            login = user.get("login") if isinstance(user, dict) else None
+            if not isinstance(login, str) or not login.strip():
+                raise _provider_error(label, "review sem user.login")
+            state = item.get("state")
+            if not isinstance(state, str) or state not in GITHUB_REVIEW_STATES:
+                raise _provider_error(label, f"review state invalido: {state!r}")
+            commit_id = item.get("commit_id")
+            if commit_id is not None:
+                if not isinstance(commit_id, str) or not (
+                    GITHUB_OID_PATTERN.fullmatch(commit_id.strip().lower())
+                ):
+                    raise _provider_error(label, "review commit_id invalido")
+                commit_id = commit_id.strip().lower()
+            submitted_at = item.get("submitted_at")
+            if submitted_at is None:
+                submitted_at = ""
+            if not isinstance(submitted_at, str):
+                raise _provider_error(label, "review submitted_at invalido")
+            review_id = item.get("id", 0)
+            if type(review_id) is not int:
+                raise _provider_error(label, "review id invalido")
+            reviews.append(
+                GithubReview(
+                    login=login.strip(),
+                    state=state,
+                    commit_id=commit_id,
+                    submitted_at=submitted_at,
+                    review_id=review_id,
+                )
+            )
+    return reviews
+
+
+def _github_effective_reviews(
+    reviews: list[GithubReview],
+) -> dict[str, GithubReview]:
+    ordered = sorted(
+        reviews, key=lambda item: (item.submitted_at, item.review_id)
+    )
+    effective: dict[str, GithubReview] = {}
+    for review in ordered:
+        # Comment/pending nao revogam uma aprovacao anterior.
+        if review.state in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}:
+            effective[review.login] = review
+    return effective
+
+
+def write_review_from_github(
+    root: Path, slug: str, pr_number: int
+) -> Path:
+    ensure_toplevel(root)
+    if type(pr_number) is not int or pr_number < 1:
+        raise AtestoError("--from-github-pr exige um numero de PR >= 1")
+    config = load_config(root)
+    head = git_head(root)
+    provider_head, url, decision = _github_metadata(root, pr_number)
+    label = f"PR #{pr_number}"
+    if provider_head != head:
+        raise ProviderError(
+            f"head do {label} ({provider_head[:12]}) difere do HEAD local "
+            f"({head[:12]}); faca checkout do head do PR"
+        )
+    if decision == "CHANGES_REQUESTED":
+        raise ProviderError(
+            f"{label} tem changes requested; resolva antes de gerar review"
+        )
+    if decision == "REVIEW_REQUIRED":
+        raise ProviderError(
+            f"{label} ainda requer aprovacao (reviewDecision REVIEW_REQUIRED)"
+        )
+    effective = _github_effective_reviews(_github_reviews(root, pr_number))
+    blocking = sorted(
+        login
+        for login, review in effective.items()
+        if review.state == "CHANGES_REQUESTED"
+    )
+    if blocking:
+        raise ProviderError(
+            f"{label} tem changes requested de: " + ", ".join(blocking)
+        )
+    reviewers = sorted(
+        login
+        for login, review in effective.items()
+        if review.state == "APPROVED" and review.commit_id == provider_head
+    )
+    if not reviewers:
+        raise ProviderError(
+            f"{label} nao tem aprovacao no head {provider_head[:12]}; "
+            "peca aprovacao no commit atual"
+        )
+    fingerprint = tree_fingerprint(root, config, ref=head)
+    return _write_review_artifact(
+        root,
+        slug,
+        head=head,
+        tree_sha256=fingerprint["tree_sha256"],
+        intent=f"review do {label}",
+        verdict="APPROVED",
+        reviewers=reviewers,
+        source={"kind": "github", "ref": url},
+    )
+
+
 def init_config(
     root: Path,
     *,

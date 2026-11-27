@@ -17,6 +17,20 @@ def _root(value: str) -> Path:
     return path
 
 
+def _positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"numero inteiro positivo esperado: {value!r}"
+        ) from exc
+    if number < 1:
+        raise argparse.ArgumentTypeError(
+            f"numero inteiro positivo esperado: {value!r}"
+        )
+    return number
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="atesto",
@@ -60,6 +74,13 @@ def _parser() -> argparse.ArgumentParser:
         metavar="PATH",
         default=None,
         help="grava o review a partir de um contrato JSON v1",
+    )
+    review.add_argument(
+        "--from-github-pr",
+        metavar="N",
+        type=_positive_int,
+        default=None,
+        help="grava o review a partir das aprovacoes do PR N via gh",
     )
 
     check = sub.add_parser("check", help="valida prova/review no head")
@@ -148,14 +169,30 @@ def _run_review(args: argparse.Namespace) -> int:
         )
         if value is not None
     ]
+    sources = [
+        flag
+        for flag, value in (
+            ("--from-json", args.from_json),
+            ("--from-github-pr", args.from_github_pr),
+        )
+        if value is not None
+    ]
+    if len(sources) > 1:
+        raise core.AtestoError(
+            "review aceita apenas uma fonte: " + ", ".join(sources)
+        )
+    if sources and manual_flags:
+        raise core.AtestoError(
+            f"review {sources[0]} nao combina com flags manuais: "
+            + ", ".join(manual_flags)
+        )
     if args.from_json is not None:
-        if manual_flags:
-            raise core.AtestoError(
-                "review --from-json nao combina com flags manuais: "
-                + ", ".join(manual_flags)
-            )
         directory = core.write_review_from_json(
             root, args.slug, Path(args.from_json).expanduser()
+        )
+    elif args.from_github_pr is not None:
+        directory = core.write_review_from_github(
+            root, args.slug, args.from_github_pr
         )
     else:
         directory = core.write_review(
