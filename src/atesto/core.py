@@ -695,36 +695,39 @@ def _validate_proof(
     return data, problems
 
 
-def _validate_review_source(data: dict[str, Any]) -> list[str]:
-    if "source" not in data:
-        return []
-    source = data["source"]
+def _review_source_problems(source: Any) -> list[str]:
+    """Validate the optional review source shape once for both readers."""
     if not isinstance(source, dict):
-        return ["review.json source precisa ser objeto"]
+        return ["source precisa ser objeto"]
     problems: list[str] = []
     unknown = sorted(set(source) - REVIEW_SOURCE_KEYS)
     if unknown:
         problems.append(
-            "review.json source tem chaves desconhecidas: "
-            + ", ".join(unknown)
+            "source tem chaves desconhecidas: " + ", ".join(unknown)
         )
     missing = sorted(REVIEW_SOURCE_KEYS - set(source))
     if missing:
         problems.append(
-            "review.json source tem chaves obrigatorias ausentes: "
-            + ", ".join(missing)
+            "source tem chaves obrigatorias ausentes: " + ", ".join(missing)
         )
     kind = source.get("kind")
     if not isinstance(kind, str) or kind not in REVIEW_SOURCE_KINDS:
         problems.append(
-            "review.json source.kind precisa ser github, gitlab ou json"
+            "source.kind precisa ser github, gitlab ou json"
         )
     ref = source.get("ref")
     if not isinstance(ref, str) or not ref.strip():
-        problems.append(
-            "review.json source.ref precisa ser string nao vazia"
-        )
+        problems.append("source.ref precisa ser string nao vazia")
     return problems
+
+
+def _validate_review_source(data: dict[str, Any]) -> list[str]:
+    if "source" not in data:
+        return []
+    return [
+        f"review.json {problem}"
+        for problem in _review_source_problems(data["source"])
+    ]
 
 
 def _validate_review(
@@ -1259,6 +1262,50 @@ def _write_review_artifact(
     return directory
 
 
+def write_review_artifact(
+    root: Path,
+    slug: str,
+    *,
+    intent: str,
+    verdict: str,
+    reviewers: list[str],
+    source: dict[str, str] | None = None,
+) -> Path:
+    """Write a review bound to the current HEAD and its computed tree.
+
+    Public seam for the optional review-source adapters: the caller supplies
+    only the provider-derived facts. Atesto resolves the head and computes the
+    tree, so a provider or JSON file cannot forge them.
+    """
+    ensure_toplevel(root)
+    verdict = verdict.upper()
+    if verdict not in VALID_VERDICTS:
+        raise AtestoError(f"verdict invalido: {verdict}")
+    clean_reviewers = [item.strip() for item in reviewers if item.strip()]
+    if not clean_reviewers:
+        raise AtestoError("review exige pelo menos um reviewer")
+    intent = intent.strip()
+    if not intent:
+        raise AtestoError("review exige intent nao vazio")
+    if source is not None:
+        problems = _validate_review_source({"source": source})
+        if problems:
+            raise AtestoError("; ".join(problems))
+    config = load_config(root)
+    head = git_head(root)
+    fingerprint = tree_fingerprint(root, config, ref=head)
+    return _write_review_artifact(
+        root,
+        slug,
+        head=head,
+        tree_sha256=fingerprint["tree_sha256"],
+        intent=intent,
+        verdict=verdict,
+        reviewers=list(dict.fromkeys(clean_reviewers)),
+        source=source,
+    )
+
+
 def write_review(
     root: Path,
     slug: str,
@@ -1327,29 +1374,11 @@ def load_review_contract(path: Path) -> dict[str, Any]:
     if type(schema) is not int or schema != 1:
         raise _contract_error(path, "schema precisa ser 1")
     source = data["source"]
-    if not isinstance(source, dict):
-        raise _contract_error(path, "source precisa ser objeto")
-    unknown_source = sorted(set(source) - REVIEW_SOURCE_KEYS)
-    if unknown_source:
-        raise _contract_error(
-            path,
-            "source tem chaves desconhecidas: " + ", ".join(unknown_source),
-        )
-    missing_source = sorted(REVIEW_SOURCE_KEYS - set(source))
-    if missing_source:
-        raise _contract_error(
-            path,
-            "source tem chaves obrigatorias ausentes: "
-            + ", ".join(missing_source),
-        )
+    source_problems = _review_source_problems(source)
+    if source_problems:
+        raise _contract_error(path, "; ".join(source_problems))
     kind = source["kind"]
-    if not isinstance(kind, str) or kind not in REVIEW_SOURCE_KINDS:
-        raise _contract_error(
-            path, "source.kind precisa ser github, gitlab ou json"
-        )
     ref = source["ref"]
-    if not isinstance(ref, str) or not ref.strip():
-        raise _contract_error(path, "source.ref precisa ser string nao vazia")
     head = data["head"]
     if not isinstance(head, str) or not head.strip():
         raise _contract_error(path, "head precisa ser string nao vazia")
@@ -1419,427 +1448,6 @@ def write_review_from_json(root: Path, slug: str, path: Path) -> Path:
         verdict=contract["verdict"],
         reviewers=contract["reviewers"],
         source=contract["source"],
-    )
-
-
-class ProviderError(AtestoError):
-    """Falha ao ler um provedor externo (gh/glab)."""
-
-
-PROVIDER_AUTH_HINTS = {
-    "gh": "rode `gh auth login` ou defina GH_TOKEN",
-    "glab": "rode `glab auth login` ou defina GITLAB_TOKEN",
-}
-PROVIDER_AUTH_MARKERS = (
-    "not authenticated",
-    "authentication required",
-    "bad credentials",
-    "to get started with github cli",
-    "gh auth login",
-    "glab auth login",
-    "gh_token",
-    "github_token",
-    "gitlab_token",
-    "oauth_token",
-)
-GITHUB_REVIEW_STATES = frozenset(
-    {"APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING"}
-)
-GITHUB_REVIEW_DECISIONS = frozenset(
-    {"", "APPROVED", "CHANGES_REQUESTED", "REVIEW_REQUIRED"}
-)
-GITHUB_OID_PATTERN = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
-
-
-def _provider_not_found(command: str) -> ProviderError:
-    hint = PROVIDER_AUTH_HINTS.get(command, f"rode `{command} auth login`")
-    return ProviderError(
-        f"{command} nao encontrado no PATH; instale o CLI e {hint}"
-    )
-
-
-def run_provider_command(
-    command: str, args: list[str], *, cwd: Path | None = None
-) -> str:
-    """Executa um CLI de provedor e devolve stdout.
-
-    O exit code e checado antes de qualquer parse: `gh api` e `glab api`
-    escrevem um corpo JSON de erro em stdout mesmo quando falham.
-    """
-    try:
-        result = subprocess.run(
-            [command, *args],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            errors="surrogateescape",
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        raise _provider_not_found(command) from exc
-    except OSError as exc:
-        raise ProviderError(f"{command} nao iniciou: {exc}") from exc
-    if result.returncode != 0:
-        stderr = result.stderr.strip()
-        stdout = result.stdout.strip()
-        message = stderr or stdout
-        lowered = f"{stderr}\n{stdout}".lower()
-        if result.returncode == 4 or any(
-            marker in lowered for marker in PROVIDER_AUTH_MARKERS
-        ):
-            hint = PROVIDER_AUTH_HINTS.get(
-                command, f"rode `{command} auth login`"
-            )
-            raise ProviderError(f"{command} nao autenticado; {hint}")
-        raise ProviderError(
-            f"{command} falhou (exit {result.returncode}): "
-            + (message or "sem mensagem")
-        )
-    return result.stdout
-
-
-def provider_json(
-    command: str,
-    args: list[str],
-    label: str,
-    *,
-    cwd: Path | None = None,
-) -> Any:
-    output = run_provider_command(command, args, cwd=cwd)
-    try:
-        return json.loads(output)
-    except ValueError as exc:
-        raise ProviderError(
-            f"{command} retornou {label} malformado: esperava JSON"
-        ) from exc
-
-
-@dataclass(frozen=True)
-class GithubReview:
-    login: str
-    state: str
-    commit_id: str | None
-    submitted_at: str
-    review_id: int
-
-
-def _provider_error(label: str, message: str) -> ProviderError:
-    return ProviderError(f"{label}: {message}")
-
-
-def _github_metadata(root: Path, pr_number: int) -> tuple[str, str, str]:
-    label = f"PR #{pr_number}"
-    data = provider_json(
-        "gh",
-        [
-            "pr",
-            "view",
-            str(pr_number),
-            "--json",
-            "url,headRefOid,reviewDecision",
-        ],
-        f"metadados do {label}",
-        cwd=root,
-    )
-    if not isinstance(data, dict):
-        raise _provider_error(label, "metadados precisam ser objeto JSON")
-    head = data.get("headRefOid")
-    if not isinstance(head, str) or not GITHUB_OID_PATTERN.fullmatch(
-        head.strip().lower()
-    ):
-        raise _provider_error(label, "headRefOid invalido")
-    url = data.get("url")
-    if not isinstance(url, str) or not url.strip():
-        raise _provider_error(label, "url invalida")
-    decision = data.get("reviewDecision")
-    if decision is None:
-        decision = ""
-    if not isinstance(decision, str) or decision not in GITHUB_REVIEW_DECISIONS:
-        raise _provider_error(
-            label, f"reviewDecision invalido: {decision!r}"
-        )
-    return head.strip().lower(), url.strip(), decision
-
-
-def _github_reviews(root: Path, pr_number: int) -> list[GithubReview]:
-    label = f"PR #{pr_number}"
-    raw = provider_json(
-        "gh",
-        [
-            "api",
-            "--paginate",
-            "--slurp",
-            f"repos/{{owner}}/{{repo}}/pulls/{pr_number}/reviews",
-        ],
-        f"reviews do {label}",
-        cwd=root,
-    )
-    if not isinstance(raw, list) or not all(
-        isinstance(page, list) for page in raw
-    ):
-        raise _provider_error(
-            label, "reviews precisam ser lista de paginas JSON"
-        )
-    reviews: list[GithubReview] = []
-    for page in raw:
-        for item in page:
-            if not isinstance(item, dict):
-                raise _provider_error(label, "review precisa ser objeto")
-            user = item.get("user")
-            login = user.get("login") if isinstance(user, dict) else None
-            if not isinstance(login, str) or not login.strip():
-                raise _provider_error(label, "review sem user.login")
-            state = item.get("state")
-            if not isinstance(state, str) or state not in GITHUB_REVIEW_STATES:
-                raise _provider_error(label, f"review state invalido: {state!r}")
-            commit_id = item.get("commit_id")
-            if commit_id is not None:
-                if not isinstance(commit_id, str) or not (
-                    GITHUB_OID_PATTERN.fullmatch(commit_id.strip().lower())
-                ):
-                    raise _provider_error(label, "review commit_id invalido")
-                commit_id = commit_id.strip().lower()
-            submitted_at = item.get("submitted_at")
-            if submitted_at is None:
-                submitted_at = ""
-            if not isinstance(submitted_at, str):
-                raise _provider_error(label, "review submitted_at invalido")
-            review_id = item.get("id", 0)
-            if type(review_id) is not int:
-                raise _provider_error(label, "review id invalido")
-            reviews.append(
-                GithubReview(
-                    login=login.strip(),
-                    state=state,
-                    commit_id=commit_id,
-                    submitted_at=submitted_at,
-                    review_id=review_id,
-                )
-            )
-    return reviews
-
-
-def _github_effective_reviews(
-    reviews: list[GithubReview],
-) -> dict[str, GithubReview]:
-    ordered = sorted(
-        reviews, key=lambda item: (item.submitted_at, item.review_id)
-    )
-    effective: dict[str, GithubReview] = {}
-    for review in ordered:
-        # Comment/pending nao revogam uma aprovacao anterior.
-        if review.state in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}:
-            effective[review.login] = review
-    return effective
-
-
-def write_review_from_github(
-    root: Path, slug: str, pr_number: int
-) -> Path:
-    ensure_toplevel(root)
-    if type(pr_number) is not int or pr_number < 1:
-        raise AtestoError("--from-github-pr exige um numero de PR >= 1")
-    config = load_config(root)
-    head = git_head(root)
-    provider_head, url, decision = _github_metadata(root, pr_number)
-    label = f"PR #{pr_number}"
-    if provider_head != head:
-        raise ProviderError(
-            f"head do {label} ({provider_head[:12]}) difere do HEAD local "
-            f"({head[:12]}); faca checkout do head do PR"
-        )
-    if decision == "CHANGES_REQUESTED":
-        raise ProviderError(
-            f"{label} tem changes requested; resolva antes de gerar review"
-        )
-    if decision == "REVIEW_REQUIRED":
-        raise ProviderError(
-            f"{label} ainda requer aprovacao (reviewDecision REVIEW_REQUIRED)"
-        )
-    effective = _github_effective_reviews(_github_reviews(root, pr_number))
-    blocking = sorted(
-        login
-        for login, review in effective.items()
-        if review.state == "CHANGES_REQUESTED"
-    )
-    if blocking:
-        raise ProviderError(
-            f"{label} tem changes requested de: " + ", ".join(blocking)
-        )
-    reviewers = sorted(
-        login
-        for login, review in effective.items()
-        if review.state == "APPROVED" and review.commit_id == provider_head
-    )
-    if not reviewers:
-        raise ProviderError(
-            f"{label} nao tem aprovacao no head {provider_head[:12]}; "
-            "peca aprovacao no commit atual"
-        )
-    fingerprint = tree_fingerprint(root, config, ref=head)
-    return _write_review_artifact(
-        root,
-        slug,
-        head=head,
-        tree_sha256=fingerprint["tree_sha256"],
-        intent=f"review do {label}",
-        verdict="APPROVED",
-        reviewers=reviewers,
-        source={"kind": "github", "ref": url},
-    )
-
-
-GITLAB_SHA_PATTERN = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
-
-
-def _gitlab_project() -> str:
-    for name in ("CI_MERGE_REQUEST_PROJECT_ID", "CI_PROJECT_ID"):
-        value = os.environ.get(name, "").strip()
-        if value:
-            if not value.isdigit():
-                raise ProviderError(
-                    f"{name} invalido: {value!r}; esperava o id numerico "
-                    "do projeto GitLab"
-                )
-            return value
-    return ":fullpath"
-
-
-def _gitlab_endpoint(iid: int, suffix: str = "") -> str:
-    return f"projects/{_gitlab_project()}/merge_requests/{iid}{suffix}"
-
-
-GITLAB_TOKEN_HINT = (
-    "GitLab exige GITLAB_TOKEN com escopo read_api (ou api) para ler o MR "
-    "e as aprovacoes; CI_JOB_TOKEN nao le /approvals; rode `glab auth login` "
-    "para autenticar"
-)
-
-
-def _gitlab_api(root: Path, iid: int, suffix: str, label: str) -> Any:
-    try:
-        return provider_json(
-            "glab",
-            ["api", _gitlab_endpoint(iid, suffix)],
-            label,
-            cwd=root,
-        )
-    except ProviderError as exc:
-        lowered = str(exc).lower()
-        if "401" in lowered or "unauthorized" in lowered:
-            raise ProviderError(
-                f"{label}: glab nao autenticado; {GITLAB_TOKEN_HINT}"
-            ) from exc
-        if "403" in lowered or "forbidden" in lowered:
-            raise ProviderError(
-                f"{label}: acesso negado (403); {GITLAB_TOKEN_HINT}"
-            ) from exc
-        raise
-
-
-def _gitlab_mr(root: Path, iid: int) -> tuple[str, str, str, bool]:
-    label = f"MR !{iid}"
-    data = _gitlab_api(
-        root, iid, "", f"metadados do {label}"
-    )
-    if not isinstance(data, dict):
-        raise _provider_error(label, "metadados precisam ser objeto JSON")
-    sha = data.get("sha")
-    if not isinstance(sha, str) or not GITLAB_SHA_PATTERN.fullmatch(
-        sha.strip().lower()
-    ):
-        raise _provider_error(label, "sha invalido")
-    status = data.get("detailed_merge_status")
-    if not isinstance(status, str) or not status.strip():
-        raise _provider_error(label, "detailed_merge_status invalido")
-    blocking = data.get("blocking_discussions_resolved")
-    if type(blocking) is not bool:
-        raise _provider_error(
-            label, "blocking_discussions_resolved invalido"
-        )
-    url = data.get("web_url")
-    if not isinstance(url, str) or not url.strip():
-        raise _provider_error(label, "web_url invalido")
-    return (
-        sha.strip().lower(),
-        status.strip(),
-        url.strip(),
-        blocking,
-    )
-
-
-def _gitlab_approvers(root: Path, iid: int) -> list[str]:
-    label = f"MR !{iid}"
-    data = _gitlab_api(
-        root, iid, "/approvals", f"aprovacoes do {label}"
-    )
-    if not isinstance(data, dict):
-        raise _provider_error(label, "aprovacoes precisam ser objeto JSON")
-    approved = data.get("approved")
-    if type(approved) is not bool:
-        raise _provider_error(label, "approved precisa ser booleano")
-    approved_by = data.get("approved_by")
-    if not isinstance(approved_by, list):
-        raise _provider_error(label, "approved_by precisa ser lista")
-    logins: list[str] = []
-    for entry in approved_by:
-        if not isinstance(entry, dict):
-            raise _provider_error(label, "approved_by precisa conter objetos")
-        user = entry.get("user")
-        username = user.get("username") if isinstance(user, dict) else None
-        if not isinstance(username, str) or not username.strip():
-            raise _provider_error(label, "approved_by sem user.username")
-        logins.append(username.strip())
-    if not approved:
-        raise ProviderError(
-            f"{label} nao esta aprovado (approved=false)"
-        )
-    if not logins:
-        raise ProviderError(
-            f"{label} nao tem aprovacoes (approved_by vazio)"
-        )
-    return sorted(set(logins))
-
-
-def write_review_from_gitlab(
-    root: Path, slug: str, iid: int
-) -> Path:
-    ensure_toplevel(root)
-    if type(iid) is not int or iid < 1:
-        raise AtestoError("--from-gitlab-mr exige um IID de MR >= 1")
-    config = load_config(root)
-    head = git_head(root)
-    provider_head, status, url, blocking = _gitlab_mr(root, iid)
-    label = f"MR !{iid}"
-    if provider_head != head:
-        raise ProviderError(
-            f"sha do {label} ({provider_head[:12]}) difere do HEAD local "
-            f"({head[:12]}); faca checkout do head do MR"
-        )
-    if status == "requested_changes":
-        raise ProviderError(
-            f"{label} tem requested changes; resolva antes de gerar review"
-        )
-    if status == "not_approved":
-        raise ProviderError(
-            f"{label} ainda nao foi aprovado "
-            "(detailed_merge_status not_approved)"
-        )
-    if not blocking or status == "discussions_not_resolved":
-        raise ProviderError(
-            f"{label} tem discussoes bloqueantes nao resolvidas"
-        )
-    reviewers = _gitlab_approvers(root, iid)
-    fingerprint = tree_fingerprint(root, config, ref=head)
-    return _write_review_artifact(
-        root,
-        slug,
-        head=head,
-        tree_sha256=fingerprint["tree_sha256"],
-        intent=f"review do {label}",
-        verdict="APPROVED",
-        reviewers=reviewers,
-        source={"kind": "gitlab", "ref": url},
     )
 
 

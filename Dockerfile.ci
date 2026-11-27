@@ -1,0 +1,36 @@
+# CI-only image: installs a wheel built from the current source instead of the
+# published PyPI wheel, so the container smoke test is green before a release
+# exists on PyPI. The release image is the root `Dockerfile`.
+FROM python:3.12-slim@sha256:191083cdf6c7bda8c76158983163ead5d5cf7b77cf3033e805bb0f5296f51b4b
+
+# Version and wheel hash are supplied by container.yml after building the
+# wheel; they keep the image labels comparable to the release image.
+ARG ATESTO_VERSION
+ARG ATESTO_SHA256
+
+LABEL org.opencontainers.image.title="Atesto" \
+      org.opencontainers.image.version="${ATESTO_VERSION}" \
+      org.opencontainers.image.source="https://github.com/guihirsch/atesto" \
+      dev.atesto.wheel-sha256="${ATESTO_SHA256}"
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin atesto \
+    && mkdir -p /repo \
+    && chown atesto:atesto /repo
+
+# No --require-hashes: this is a local, reproducible CI build of the source
+# tree, not a PyPI download. Atesto is stdlib-only, hence --no-deps.
+COPY dist/ /tmp/dist/
+RUN python -m pip install --no-cache-dir --no-deps /tmp/dist/atesto-*.whl \
+    && rm -rf /tmp/dist
+
+USER atesto
+WORKDIR /repo
+ENTRYPOINT ["atesto"]
