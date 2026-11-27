@@ -419,6 +419,10 @@ CircleCI and Buildkite. Each one runs the published container image
 read the base config, sets the base ref and runs only the gate. The version in
 the snippets must match `pyproject.toml`; `CISnippetTest` fails on drift.
 
+The published 0.3.0 image is also available by digest:
+`ghcr.io/guihirsch/atesto@sha256:bdd41341c8a1dc9a7cfb535f4288aa889ac1a754877dc67bcb2673a9f59daa19`.
+Prefer the digest in production; the version tag is the minimum.
+
 ### Generate the review before you commit
 
 `check --ci` requires the evidence directory to be part of the PR diff. The
