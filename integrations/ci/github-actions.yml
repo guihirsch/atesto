@@ -1,0 +1,45 @@
+# Atesto gate - optional, additive GitHub Actions workflow.
+#
+# Add this as a new workflow file; do not edit existing workflows. The image
+# version must match pyproject.toml; the structural test `CISnippetTest`
+# fails when it drifts.
+#
+# BASE_REF is the pull request target branch. Merge enforcement stays with
+# GitHub branch protection/rulesets and the merge queue, not with this job.
+#
+# Generate docs/atesto/<slug>/review.json before you commit the branch (see
+# README.md); this workflow only runs the gate. `check --ci` requires the
+# evidence directory to be part of the PR diff, so CI must not create it.
+name: atesto gate (container)
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: atesto-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          # Fetch the complete history so `check --ci` can read the base config.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Atesto gate
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+        run: |
+          # Match the CI user so the bind-mounted .git is trusted and
+          # writable; the image itself runs as non-root.
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$PWD:/repo" -w /repo \
+            ghcr.io/guihirsch/atesto:0.3.0 \
+            check --ci --base "$BASE_REF"

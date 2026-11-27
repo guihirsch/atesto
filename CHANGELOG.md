@@ -1,5 +1,63 @@
 # Changelog
 
+## [0.3.0] - 2026-11-27
+
+### Added
+
+- Contrato JSON de review v1 estrito via `--from-json PATH`: `schema`,
+  `source` (`kind`, `ref`), `head`, `verdict`, `reviewers` e `intent`. Chaves
+  desconhecidas, duplicadas e JSON malformado reprovam; o `head` do contrato é
+  um guard e precisa ser HEAD ou um ancestral com a mesma árvore, e o tree é
+  sempre calculado pelo Atesto, nunca lido do JSON.
+- Fonte GitHub PR (`--from-github-pr N`): lê o head e as reviews pelo `gh`,
+  conta só `APPROVED` cujo commit é o head do PR, mantém a última review por
+  login e reprova em `CHANGES_REQUESTED`, `REVIEW_REQUIRED`, head divergente,
+  CLI ausente/sem autenticação, saída malformada e erro HTTP.
+- Fonte GitLab MR (`--from-gitlab-mr IID`): exige o SHA do MR igual ao HEAD,
+  usa `approved_by`, reprova em `requested_changes`, `not_approved`,
+  discussões bloqueantes, 401/403 e CLI ausente/sem autenticação.
+- `source` opcional em `review.json` (`github`, `gitlab` ou `json`), validado
+  pelo `check` e exposto em `check --json`; artefatos antigos sem `source`
+  continuam válidos.
+- Imagem de container `ghcr.io/guihirsch/atesto`: Python 3.12 slim pinado por
+  digest, `git`, wheel pinado por sha256, usuário não-root, `WORKDIR /repo` e
+  `ENTRYPOINT ["atesto"]`. Labels gravam a versão e o sha256 do wheel.
+  Workflow de smoke em mudanças de container e publicação da imagem no
+  release (tags de versão e `latest`).
+- Snippets aditivos para GitLab CI, GitHub Actions, Jenkins, CircleCI e
+  Buildkite em `integrations/ci/`: histórico completo, base ref e
+  `check --ci` na imagem pinada, sem gerar ou commitar evidência. O exemplo
+  Jenkins ganhou `jenkins.stage.groovy`, um fragmento de stage para inserir em
+  um pipeline existente.
+- README: quickstart até `atesto: ok`, threat model, matriz host/CI,
+  contrato JSON v1 completo (campos, exemplo, head guard e modos de falha),
+  limites de aprovação stale do GitLab, política de bots/`reviewDecision` do
+  GitHub, pin por digest e verificação de release (wheel e imagem publicados,
+  hashes e rebuild com `umask 022`).
+- `check --json` agora expõe a `source` da review; `doctor` continua
+  reportando a identidade da ferramenta e os problemas dos artefatos.
+
+### Changed
+
+- Versão 0.3.0. O schema de config não muda: v1 e v2 continuam iguais e
+  `atesto init` continua escrevendo v2.
+- Adaptadores de review de provedor saíram do core para o pacote opcional
+  `atesto.review_sources` (`base`, `github`, `gitlab`), importado pelo CLI só
+  quando o flag correspondente é usado. O core mantém o writer de review,
+  `check` e `--from-json`, e não codifica política de merge de provedor.
+  Aprovações de bot no GitHub não contam para `min_reviewers`.
+- Template de CI pinado em `atesto==0.3.0` com sha256; o pin do template é a
+  única fonte do hash. `Dockerfile` e `container-publish.yml` exigem
+  versão/hash como input e não têm default.
+- `release.yml` confere o wheel construído contra o pin do template **antes**
+  do PyPI, usa `umask 022` e escopa `id-token: write` ao job de publish. O job
+  de container baixa o wheel publicado, revalida o hash, builda/carrega a
+  imagem, roda smoke e confere labels antes de dar push.
+- `container.yml` builda um wheel do fonte atual com o ambiente de build e
+  `umask 022`, constrói `Dockerfile.ci` a partir desse wheel e roda o smoke;
+  o caminho de PR fica verde antes de 0.3.0 existir no PyPI.
+- 198 testes.
+
 ## [0.2.0] - 2026-11-26
 
 ### Breaking

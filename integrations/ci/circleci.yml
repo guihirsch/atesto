@@ -1,0 +1,44 @@
+# Atesto gate - optional, additive CircleCI job.
+#
+# Add this job and workflow to your config; do not replace existing jobs.
+# The image version must match pyproject.toml; the structural test
+# `CISnippetTest` fails when it drifts.
+#
+# The machine executor provides git, SSH and Docker for CircleCI's checkout;
+# the gate itself runs in the pinned Atesto container.
+#
+# BASE_REF is read from ATESTO_BASE_REF (project environment or context) and
+# defaults to origin/main. Merge enforcement stays with your VCS branch
+# protection/rulesets, not with this job.
+#
+# Generate docs/atesto/<slug>/review.json before you commit the branch (see
+# README.md); this job only runs the gate. `check --ci` requires the evidence
+# directory to be part of the PR diff, so CI must not create it.
+version: 2.1
+
+jobs:
+  atesto-gate:
+    machine:
+      image: ubuntu-2204:current
+    steps:
+      - checkout
+      - run:
+          name: Fetch full history and run the Atesto gate
+          command: |
+            set -eu
+            # CircleCI checkouts may be shallow; make the history complete.
+            git fetch --unshallow 2>/dev/null || true
+            BASE_REF="${ATESTO_BASE_REF:-origin/main}"
+            git fetch origin \
+              "+refs/heads/${BASE_REF#origin/}:refs/remotes/${BASE_REF}"
+            # Match the CI user so the bind-mounted .git is trusted and
+            # writable; the image itself runs as non-root.
+            docker run --rm --user "$(id -u):$(id -g)" \
+              -v "$PWD:/repo" -w /repo \
+              ghcr.io/guihirsch/atesto:0.3.0 \
+              check --ci --base "$BASE_REF"
+
+workflows:
+  atesto:
+    jobs:
+      - atesto-gate

@@ -1,0 +1,104 @@
+name: container-publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Atesto version published to PyPI
+        required: true
+        type: string
+      wheel_sha256:
+        description: SHA-256 of that atesto wheel on PyPI
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download the published wheel
+        run: |
+          mkdir -p dist
+          for attempt in 1 2 3 4 5 6; do
+            if python -m pip download \
+              --no-deps \
+              --only-binary=:all: \
+              --dest dist \
+              "atesto==${{ inputs.version }}"; then
+              break
+            fi
+            if [ "$attempt" -eq 6 ]; then
+              exit 1
+            fi
+            sleep 15
+          done
+      # The workflow input is not a second source of truth: verify it against
+      # the wheel PyPI actually serves before the image is built or pushed.
+      - name: Verify the PyPI wheel against the supplied hash
+        run: |
+          set -eu
+          wheel="dist/atesto-${{ inputs.version }}-py3-none-any.whl"
+          supplied="${{ inputs.wheel_sha256 }}"
+          actual="$(sha256sum "$wheel" | cut -d' ' -f1)"
+          echo "PyPI wheel:     $actual"
+          echo "supplied hash:  $supplied"
+          case "$supplied" in
+            ""|*[!0-9a-f]*)
+              echo "wheel_sha256 must be 64 lowercase hex characters" >&2
+              exit 1
+              ;;
+          esac
+          test "${#supplied}" -eq 64
+          test "$actual" = "$supplied"
+          echo "ATESTO_WHEEL_SHA256=$actual" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and load the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          build-args: |
+            ATESTO_VERSION=${{ inputs.version }}
+            ATESTO_SHA256=${{ env.ATESTO_WHEEL_SHA256 }}
+          tags: |
+            ghcr.io/guihirsch/atesto:${{ inputs.version }}
+            ghcr.io/guihirsch/atesto:latest
+      - name: Smoke the loaded image
+        run: |
+          bash tests/container-smoke.sh \
+            "ghcr.io/guihirsch/atesto:${{ inputs.version }}" \
+            "${{ inputs.version }}"
+      - name: Verify the loaded image labels
+        run: |
+          image="ghcr.io/guihirsch/atesto:${{ inputs.version }}"
+          version="$(docker image inspect \
+            --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' \
+            "$image")"
+          wheel_sha256="$(docker image inspect \
+            --format '{{ index .Config.Labels "dev.atesto.wheel-sha256" }}' \
+            "$image")"
+          echo "image version:    $version"
+          echo "image wheel hash: $wheel_sha256"
+          test "$version" = "${{ inputs.version }}"
+          test "$wheel_sha256" = "$ATESTO_WHEEL_SHA256"
+      - name: Push the verified image
+        run: |
+          docker push "ghcr.io/guihirsch/atesto:${{ inputs.version }}"
+          docker push ghcr.io/guihirsch/atesto:latest

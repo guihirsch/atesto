@@ -1,0 +1,32 @@
+# Atesto gate - optional, additive GitLab CI job.
+#
+# Add this job as a new job (and stage, if needed); do not rewrite existing
+# jobs. The image version must match pyproject.toml; the structural test
+# `CISnippetTest` fails when it drifts.
+#
+# BASE_REF is the merge request target branch. Merge enforcement stays with
+# GitLab protected branches/approval rules, not with this job.
+#
+# Generate docs/atesto/<slug>/review.json before you commit the branch (see
+# README.md); this job only runs the gate. `check --ci` requires the evidence
+# directory to be part of the MR diff, so a CI job must not create it.
+atesto-gate:
+  stage: test
+  image:
+    name: ghcr.io/guihirsch/atesto:0.3.0
+    entrypoint: [""]
+  variables:
+    # Fetch the complete history so `check --ci` can read the base config.
+    GIT_DEPTH: "0"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  script:
+    - |
+      set -eu
+      # GitLab Runner checks out as root but runs this image as uid 10001.
+      # Mark the workspace safe instead of writing to .git.
+      export GIT_CONFIG_COUNT=1
+      export GIT_CONFIG_KEY_0=safe.directory
+      export GIT_CONFIG_VALUE_0="$CI_PROJECT_DIR"
+      BASE_REF="origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}"
+      atesto check --ci --base "$BASE_REF"

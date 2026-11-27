@@ -17,6 +17,20 @@ def _root(value: str) -> Path:
     return path
 
 
+def _positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"numero inteiro positivo esperado: {value!r}"
+        ) from exc
+    if number < 1:
+        raise argparse.ArgumentTypeError(
+            f"numero inteiro positivo esperado: {value!r}"
+        )
+    return number
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="atesto",
@@ -51,10 +65,34 @@ def _parser() -> argparse.ArgumentParser:
     review = sub.add_parser("review", help="grava review.json no head")
     review.add_argument("slug")
     review.add_argument("--root", default=".")
-    review.add_argument("--head", default="HEAD")
-    review.add_argument("--verdict", default="APPROVED")
-    review.add_argument("--reviewer", action="append", default=[])
-    review.add_argument("--intent", default="")
+    review.add_argument("--head", default=None)
+    review.add_argument("--verdict", default=None)
+    review.add_argument("--reviewer", action="append", default=None)
+    review.add_argument("--intent", default=None)
+    review.add_argument(
+        "--from-json",
+        metavar="PATH",
+        default=None,
+        help="grava o review a partir de um contrato JSON v1",
+    )
+    review.add_argument(
+        "--from-github-pr",
+        metavar="N",
+        type=_positive_int,
+        default=None,
+        help="grava o review a partir das aprovacoes do PR N via gh",
+    )
+    review.add_argument(
+        "--from-gitlab-mr",
+        metavar="IID",
+        type=_positive_int,
+        default=None,
+        help=(
+            "grava o review a partir das aprovacoes do MR IID via glab "
+            "(projeto: CI_MERGE_REQUEST_PROJECT_ID/CI_PROJECT_ID no CI; "
+            "senao o remote do repo)"
+        ),
+    )
 
     check = sub.add_parser("check", help="valida prova/review no head")
     check.add_argument("--root", default=".")
@@ -132,14 +170,61 @@ def _run_proof(args: argparse.Namespace) -> int:
 
 def _run_review(args: argparse.Namespace) -> int:
     root = _root(args.root)
-    directory = core.write_review(
-        root,
-        args.slug,
-        head=args.head,
-        verdict=args.verdict,
-        reviewers=args.reviewer,
-        intent=args.intent,
-    )
+    manual_flags = [
+        name
+        for name, value in (
+            ("--head", args.head),
+            ("--verdict", args.verdict),
+            ("--reviewer", args.reviewer),
+            ("--intent", args.intent),
+        )
+        if value is not None
+    ]
+    sources = [
+        flag
+        for flag, value in (
+            ("--from-json", args.from_json),
+            ("--from-github-pr", args.from_github_pr),
+            ("--from-gitlab-mr", args.from_gitlab_mr),
+        )
+        if value is not None
+    ]
+    if len(sources) > 1:
+        raise core.AtestoError(
+            "review aceita apenas uma fonte: " + ", ".join(sources)
+        )
+    if sources and manual_flags:
+        raise core.AtestoError(
+            f"review {sources[0]} nao combina com flags manuais: "
+            + ", ".join(manual_flags)
+        )
+    if args.from_json is not None:
+        directory = core.write_review_from_json(
+            root, args.slug, Path(args.from_json).expanduser()
+        )
+    elif args.from_github_pr is not None:
+        # Optional adapter: import only when this source is selected, so the
+        # core path never loads provider policy.
+        from .review_sources.github import write_review_from_github
+
+        directory = write_review_from_github(
+            root, args.slug, args.from_github_pr
+        )
+    elif args.from_gitlab_mr is not None:
+        from .review_sources.gitlab import write_review_from_gitlab
+
+        directory = write_review_from_gitlab(
+            root, args.slug, args.from_gitlab_mr
+        )
+    else:
+        directory = core.write_review(
+            root,
+            args.slug,
+            head=args.head if args.head is not None else "HEAD",
+            verdict=args.verdict if args.verdict is not None else "APPROVED",
+            reviewers=args.reviewer or [],
+            intent=args.intent if args.intent is not None else "",
+        )
     print(f"atesto: review salvo em {directory / 'review.json'}")
     return 0
 

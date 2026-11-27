@@ -1,0 +1,29 @@
+# Atesto gate - optional, additive Buildkite step.
+#
+# Add this step to a pipeline (or copy it into a new pipeline); do not
+# replace existing steps. The image version must match pyproject.toml; the
+# structural test `CISnippetTest` fails when it drifts.
+#
+# BASE_REF comes from BUILDKITE_PULL_REQUEST_BASE_BRANCH and defaults to
+# main. Merge enforcement stays with your VCS branch protection/rulesets,
+# not with this step.
+#
+# Generate docs/atesto/<slug>/review.json before you commit the branch (see
+# README.md); this step only runs the gate. `check --ci` requires the
+# evidence directory to be part of the PR diff, so CI must not create it.
+steps:
+  - label: ":shield: Atesto gate"
+    key: atesto-gate
+    command: |
+      set -eu
+      # Buildkite checkouts may be shallow; make the history complete.
+      git fetch --unshallow 2>/dev/null || true
+      BASE_REF="origin/${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-main}"
+      git fetch origin \
+        "+refs/heads/${BASE_REF#origin/}:refs/remotes/${BASE_REF}"
+      # Match the agent user so the bind-mounted .git is trusted and
+      # writable; the image itself runs as non-root.
+      docker run --rm --user "$(id -u):$(id -g)" \
+        -v "$PWD:/repo" -w /repo \
+        ghcr.io/guihirsch/atesto:0.3.0 \
+        check --ci --base "$BASE_REF"
