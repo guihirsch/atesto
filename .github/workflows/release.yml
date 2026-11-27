@@ -5,12 +5,14 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     environment: pypi
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -32,7 +34,26 @@ jobs:
       - name: Build sdist and wheel
         env:
           SOURCE_DATE_EPOCH: "1795651200"
-        run: python -m build --no-isolation
+        run: |
+          set -eu
+          umask 022
+          python -m build --no-isolation
+      # The committed template pin is the release gate: verify the wheel we
+      # just built before it is uploaded, not after PyPI has accepted it.
+      - name: Verify the built wheel against the template pin
+        run: |
+          set -eu
+          wheel="dist/atesto-0.3.0-py3-none-any.whl"
+          built_sha256="$(sha256sum "$wheel" | cut -d' ' -f1)"
+          pinned_sha256="$(
+            grep -oE 'sha256:[0-9a-f]{64}' \
+              integrations/github-actions/atesto-gate.yml |
+              head -n 1 | cut -d: -f2
+          )"
+          echo "built wheel:  $built_sha256"
+          echo "template pin: $pinned_sha256"
+          test -n "$pinned_sha256"
+          test "$built_sha256" = "$pinned_sha256"
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
 
@@ -88,20 +109,23 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push
+      # Build and load first: the image is pushed only after the smoke test and
+      # the label check prove it matches the published wheel.
+      - name: Build and load the image
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
+          load: true
+          push: false
           build-args: |
             ATESTO_VERSION=0.3.0
             ATESTO_SHA256=${{ env.ATESTO_WHEEL_SHA256 }}
           tags: |
             ghcr.io/guihirsch/atesto:0.3.0
             ghcr.io/guihirsch/atesto:latest
-      - name: Smoke the published image
+      - name: Smoke the loaded image
         run: bash tests/container-smoke.sh ghcr.io/guihirsch/atesto:0.3.0 0.3.0
-      - name: Verify the published image labels
+      - name: Verify the loaded image labels
         run: |
           image="ghcr.io/guihirsch/atesto:0.3.0"
           version="$(docker image inspect \
@@ -114,3 +138,7 @@ jobs:
           echo "image wheel hash: $wheel_sha256"
           test "$version" = "0.3.0"
           test "$wheel_sha256" = "$ATESTO_WHEEL_SHA256"
+      - name: Push the verified image
+        run: |
+          docker push ghcr.io/guihirsch/atesto:0.3.0
+          docker push ghcr.io/guihirsch/atesto:latest

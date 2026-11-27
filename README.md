@@ -147,6 +147,11 @@ combined with another source or with the manual `--head`, `--verdict`,
 - `--from-github-pr N` reads a GitHub PR through `gh`.
 - `--from-gitlab-mr IID` reads a GitLab MR through `glab`.
 
+The provider readers live in the optional `atesto.review_sources` package and
+are imported only when their flag is used. The core keeps manual `review`,
+`--from-json` and `check`; it does not encode provider merge policy. CI and
+domain adapters live under `integrations/` and stay optional as well.
+
 ### GitHub PR approvals
 
 `gh` must be installed and authenticated (`gh auth login` or `GH_TOKEN`);
@@ -160,6 +165,9 @@ gh api --paginate --slurp repos/{owner}/{repo}/pulls/N/reviews
 The adapter then:
 
 - counts only `APPROVED` reviews whose `commit_id` is the PR head;
+- counts people, not automation: a review whose `user.type` is `Bot` or whose
+  login ends in `[bot]` never contributes to `min_reviewers` (a bot-only
+  approval set fails closed);
 - keeps the latest review per login (a later comment does not revoke an
   approval; a dismissal does), dedupes logins and sorts them;
 - fails closed on `CHANGES_REQUESTED`, `REVIEW_REQUIRED`, no current-head
@@ -168,6 +176,13 @@ The adapter then:
   `review.json` is written on failure;
 - writes `source: {"kind": "github", "ref": "<PR URL>"}` and leaves
   `min_reviewers` enforcement to `check`.
+
+An empty `reviewDecision` (`""`) means GitHub has no required-review decision
+for the PR (usually no branch-protection review rule). This is a deliberate
+clarification of ticket #14: the adapter does not treat the absence of a
+decision as approval, and still requires at least one current-head approval
+(`APPROVED`) from a person. It fails closed on `CHANGES_REQUESTED` and
+`REVIEW_REQUIRED`.
 
 The adapter uses whatever repository `gh` resolves (the current clone, or
 `GH_REPO`). Inside a fork `gh` resolves the fork, so to read approvals for an
@@ -206,9 +221,58 @@ The adapter then:
   failure;
 - writes `source: {"kind": "gitlab", "ref": "<MR URL>"}`.
 
+**Stale approval limitation:** GitLab approvals carry no per-approval SHA, so
+Atesto cannot prove that an approval was issued for the current push. The MR
+`sha` check is the only head guard the API exposes. When the project enables
+`reset_approvals_on_push`, GitLab resets approvals on a push; when it is
+disabled, an old approval can survive a new commit. Atesto does not invent
+per-approval SHA data: enable `reset_approvals_on_push` (and re-approve after a
+push) when approvals must bind to the exact head.
+
 GitLab requires authentication to read `/approvals`; `CI_JOB_TOKEN` is not
 allowed to call that endpoint, so provide `GITLAB_TOKEN` with `read_api` (or
 `api`) scope. Check out the MR head locally before running the command.
+
+## Strict JSON contract v1
+
+`--from-json PATH` is the escape hatch for Jira, Sonar, or any custom approval
+system. The file is strict and versioned: every field below is required and
+non-empty, and unknown fields fail closed.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `schema` | integer | Contract version; must be `1`. |
+| `source` | object | `{"kind": ..., "ref": ...}` provenance. |
+| `source.kind` / `kind` | string | `github`, `gitlab` or `json`. |
+| `source.ref` / `ref` | string | Provider URL, change id or ticket id. |
+| `head` | string | Commit id the approval applies to (guard only). |
+| `verdict` | string | `APPROVED` or `CHANGES_REQUESTED`. |
+| `reviewers` | array of strings | At least one distinct reviewer login. |
+| `intent` | string | Why the change was approved. |
+
+```json
+{
+  "schema": 1,
+  "source": {"kind": "json", "ref": "jira-42"},
+  "head": "0123456789abcdef0123456789abcdef01234567",
+  "verdict": "APPROVED",
+  "reviewers": ["alice", "bob"],
+  "intent": "aprovar a mudanca 123"
+}
+```
+
+**Head guard:** Atesto resolves `head` itself and computes the tree from the
+repo. The value must resolve to `HEAD` or to an ancestor whose evidence tree is
+the same tree (an evidence-only commit on top is fine; a code change is not).
+The artifact always records the resolved current `HEAD` and the computed
+`tree_sha256`, never the values from the file.
+
+**Failure modes:** malformed JSON, a duplicated key, an unknown top-level key,
+`schema` other than 1, a missing or blank `source.kind`/`source.ref`, an
+unknown source kind, a blank `head`, an unresolvable head, a non-ancestor head,
+an ancestor with a changed tree, a missing or invalid `verdict`, an
+empty/blank reviewer list, and a blank `intent` all fail closed. No
+`review.json` is written on failure.
 
 ## Config
 
@@ -360,9 +424,11 @@ the snippets must match `pyproject.toml`; `CISnippetTest` fails on drift.
 `check --ci` requires the evidence directory to be part of the PR diff. The
 snippets therefore **do not generate, commit or push evidence**: a CI-created
 artifact is either absent from the diff (the gate fails) or belongs to a new
-commit the provider approval was not issued for. Generate the review on the
-branch as a pre-commit step for the author or agent, then commit it with the
-code:
+commit the provider approval was not issued for. This is a deliberate
+deviation from ticket #16's "review + check" wording: the snippets run only
+`check --ci`, and review generation is a documented pre-commit step because
+the evidence must be in the PR/MR diff. Generate the review on the branch as a
+pre-commit step for the author or agent, then commit it with the code:
 
 ```bash
 # GitHub PR approvals (needs gh, checked out on the PR head)
@@ -437,17 +503,37 @@ so keep the snippet and `atesto.json` in CODEOWNERS.
   changes the hash;
 - the gate template is the single source of truth for the release pin:
   `atesto==0.3.0` with the published wheel sha256. The README does not repeat
-  the hash, so it cannot drift;
+  the hash, so it cannot drift; `Dockerfile` and `container-publish.yml` have
+  no hash defaults and require the value from their caller;
+- before the PyPI publish, `release.yml` builds the wheel with `umask 022` and
+  compares its sha256 to the template pin. A mismatch stops the release before
+  anything is uploaded;
 - after the PyPI publish, the `container` job in `release.yml` downloads the
-  published `atesto==0.3.0`, computes its sha256, compares it to the template
-  pin, builds and pushes `ghcr.io/guihirsch/atesto:0.3.0` and `:latest` with
-  that hash, then smokes the image.
+  published `atesto==0.3.0`, checks the hash again, builds and **loads** the
+  image, smokes it, verifies the version and wheel-hash labels, and only then
+  pushes `ghcr.io/guihirsch/atesto:0.3.0` and `:latest`.
   `.github/workflows/container-publish.yml` remains available for manual
-  dispatch with explicit version and hash inputs.
+  dispatch; it requires the version and wheel hash (no defaults), downloads the
+  PyPI wheel, verifies the supplied hash, and follows the same
+  build/load/smoke/label/push order.
+- the PR container workflow builds a wheel from the current source with the
+  same pinned environment and `umask 022`, then builds `Dockerfile.ci` and
+  smokes that local-wheel image. It is green before 0.3.0 exists on PyPI; the
+  release `Dockerfile` keeps installing the published wheel with the hash.
 
 PyPI and GHCR are updated after the release commit is merged (post-merge).
-The template hash is therefore verified against the published wheel by the
-release workflow; it is not assumed from a local build.
+The template hash is verified against the reproducible local build before the
+publish and against the published wheel after it; it is not assumed.
+
+For production, pin the image by digest, not only by version tag: the version
+tag is the minimum. Record the digest from the release image and use
+`ghcr.io/guihirsch/atesto@sha256:<digest>` in your job:
+
+```bash
+docker buildx imagetools inspect ghcr.io/guihirsch/atesto:0.3.0
+# Copy the manifest digest, e.g.
+# ghcr.io/guihirsch/atesto@sha256:0123... in the snippet.
+```
 
 Verify a release directly from the published artifacts instead of trusting a
 local rebuild:

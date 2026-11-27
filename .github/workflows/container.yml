@@ -4,15 +4,21 @@ on:
   push:
     paths:
       - Dockerfile
+      - Dockerfile.ci
       - .github/workflows/container.yml
       - .github/workflows/container-publish.yml
       - tests/container-smoke.sh
+      - pyproject.toml
+      - src/**
   pull_request:
     paths:
       - Dockerfile
+      - Dockerfile.ci
       - .github/workflows/container.yml
       - .github/workflows/container-publish.yml
       - tests/container-smoke.sh
+      - pyproject.toml
+      - src/**
 
 permissions:
   contents: read
@@ -24,7 +30,41 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Build image
-        run: docker build --tag atesto:smoke .
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Same pinned build environment as release.yml, so the wheel built here
+      # matches the wheel the release verifies against the template pin.
+      - name: Pin build environment
+        run: |
+          python -m pip install \
+            "build==1.6.1" \
+            "setuptools==84.2.1" \
+            "wheel==0.48.0"
+      - name: Build wheel from source
+        env:
+          SOURCE_DATE_EPOCH: "1795651200"
+        run: |
+          set -eu
+          umask 022
+          rm -rf dist
+          python -m build --no-isolation
+      - name: Read version and wheel hash
+        run: |
+          set -eu
+          version="$(python -c "import pathlib, tomllib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")"
+          wheel="dist/atesto-${version}-py3-none-any.whl"
+          sha256="$(sha256sum "$wheel" | cut -d' ' -f1)"
+          echo "ATESTO_VERSION=$version" >> "$GITHUB_ENV"
+          echo "ATESTO_SHA256=$sha256" >> "$GITHUB_ENV"
+      # PR smoke must not depend on the release being on PyPI: the CI image
+      # installs the wheel built above from the current source.
+      - name: Build CI image from the local wheel
+        run: |
+          docker build \
+            --file Dockerfile.ci \
+            --build-arg ATESTO_VERSION="$ATESTO_VERSION" \
+            --build-arg ATESTO_SHA256="$ATESTO_SHA256" \
+            --tag atesto:smoke .
       - name: Smoke test
-        run: bash tests/container-smoke.sh atesto:smoke 0.3.0
+        run: bash tests/container-smoke.sh atesto:smoke "$ATESTO_VERSION"

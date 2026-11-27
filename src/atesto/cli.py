@@ -203,11 +203,17 @@ def _run_review(args: argparse.Namespace) -> int:
             root, args.slug, Path(args.from_json).expanduser()
         )
     elif args.from_github_pr is not None:
-        directory = core.write_review_from_github(
+        # Optional adapter: import only when this source is selected, so the
+        # core path never loads provider policy.
+        from .review_sources.github import write_review_from_github
+
+        directory = write_review_from_github(
             root, args.slug, args.from_github_pr
         )
     elif args.from_gitlab_mr is not None:
-        directory = core.write_review_from_gitlab(
+        from .review_sources.gitlab import write_review_from_gitlab
+
+        directory = write_review_from_gitlab(
             root, args.slug, args.from_gitlab_mr
         )
     else:

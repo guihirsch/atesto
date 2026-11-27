@@ -246,10 +246,12 @@ def github_review(
     state: str,
     commit_id: str | None,
     submitted_at: str,
+    *,
+    user_type: str = "User",
 ) -> dict[str, object]:
     return {
         "id": review_id,
-        "user": {"login": login, "type": "User"},
+        "user": {"login": login, "type": user_type},
         "state": state,
         "commit_id": commit_id,
         "submitted_at": submitted_at,
@@ -2622,6 +2624,35 @@ class ReviewFromJsonTest(unittest.TestCase):
                 )
 
 
+class ReviewSourceIdValidationTest(unittest.TestCase):
+    """Provider ids are positive integers; argparse must reject the rest."""
+
+    def test_provider_review_flags_reject_invalid_ids(self) -> None:
+        for flag in ("--from-github-pr", "--from-gitlab-mr"):
+            for value in ("0", "-1", "abc", "1.5", ""):
+                with (
+                    self.subTest(flag=flag, value=value),
+                    tempfile.TemporaryDirectory() as tmp,
+                ):
+                    repo = make_repo(tmp)
+                    init(repo)
+                    result = cli(repo, "review", "demo", flag, value)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(
+                        "numero inteiro positivo",
+                        result.stdout + result.stderr,
+                    )
+                    self.assertFalse(
+                        (
+                            repo
+                            / "docs"
+                            / "atesto"
+                            / "demo"
+                            / "review.json"
+                        ).exists()
+                    )
+
+
 class ReviewFromGithubTest(unittest.TestCase):
     def test_from_github_writes_source_and_bound_head(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2758,6 +2789,64 @@ class ReviewFromGithubTest(unittest.TestCase):
             self.assertIn(
                 "repos/{owner}/{repo}/pulls/8/reviews", calls[0]["args"]
             )
+
+    def test_from_github_does_not_count_bot_approvals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof,review")
+            config_path = repo / "atesto.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["min_reviewers"] = 2
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            proof(repo)
+            commit(repo)
+            head = git(repo, "rev-parse", "HEAD")
+            env = fake_gh(
+                tmp,
+                pr_view=github_pr(
+                    head, "https://github.com/acme/repo/pull/23"
+                ),
+                api=github_reviews(
+                    [
+                        github_review(
+                            1,
+                            "alice",
+                            "APPROVED",
+                            head,
+                            "2026-11-27T10:00:00Z",
+                        ),
+                        github_review(
+                            2,
+                            "ci[bot]",
+                            "APPROVED",
+                            head,
+                            "2026-11-27T10:01:00Z",
+                            user_type="Bot",
+                        ),
+                        github_review(
+                            3,
+                            "release[bot]",
+                            "APPROVED",
+                            head,
+                            "2026-11-27T10:02:00Z",
+                        ),
+                    ]
+                ),
+            )
+            result = cli(
+                repo, "review", "demo", "--from-github-pr", "23", env=env
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            artifact = json.loads(
+                (
+                    repo / "docs" / "atesto" / "demo" / "review.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(artifact["reviewers"], ["alice"])
+            commit(repo, "review")
+            checked = cli(repo, "check")
+            self.assertEqual(checked.returncode, 1)
+            self.assertIn("pelo menos 2", checked.stdout)
 
     def test_from_github_changes_requested_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3785,6 +3874,59 @@ class ReviewFromGitlabTest(unittest.TestCase):
             self.assertIn("pelo menos 2", checked.stdout)
 
 
+class ReviewSourceBoundaryTest(unittest.TestCase):
+    """Provider adapters are optional modules; the core stays policy-free."""
+
+    def test_adapters_live_in_their_own_package(self) -> None:
+        package = SRC / "atesto" / "review_sources"
+        self.assertTrue(package.is_dir(), package)
+        for name in ("__init__.py", "base.py", "github.py", "gitlab.py"):
+            with self.subTest(name=name):
+                self.assertTrue((package / name).is_file(), package / name)
+
+    def test_core_does_not_encode_provider_policy(self) -> None:
+        source = (SRC / "atesto" / "core.py").read_text(encoding="utf-8")
+        for token in (
+            "reviewDecision",
+            "detailed_merge_status",
+            "requested_changes",
+            "not_approved",
+            "provider_json",
+            "gh api",
+            "glab",
+        ):
+            with self.subTest(token=token):
+                self.assertNotIn(token, source)
+        self.assertNotIn("review_sources", source)
+
+    def test_importing_core_does_not_load_provider_adapters(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys; import atesto.core; "
+                    "assert 'atesto.review_sources' not in sys.modules"
+                ),
+            ],
+            cwd=ROOT,
+            env=ENV,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_docs_define_the_adapter_boundary(self) -> None:
+        contributing = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        for text in (contributing, readme):
+            with self.subTest(document=text[:20]):
+                self.assertIn("review_sources", text)
+                self.assertIn("integrations/", text)
+                self.assertRegex(text, r"(?i)optional")
+
+
 class ReviewSchemaTest(unittest.TestCase):
     def test_optional_source_matches_loader_contract(self) -> None:
         schema = json.loads(
@@ -3926,6 +4068,98 @@ class ArtifactSchemaTest(unittest.TestCase):
                 )
 
 
+class ProviderDocsTest(unittest.TestCase):
+    """Provider behavior and the JSON contract must be documented."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    def test_readme_documents_json_contract_v1(self) -> None:
+        self.assertIn("## Strict JSON contract v1", self.readme)
+        section = self.readme.split("## Strict JSON contract v1", 1)[1].split(
+            "\n## ", 1
+        )[0]
+        for field in (
+            "schema",
+            "source",
+            "kind",
+            "ref",
+            "head",
+            "verdict",
+            "reviewers",
+            "intent",
+        ):
+            with self.subTest(field=field):
+                self.assertIn(f"`{field}`", section)
+        blocks = [
+            json.loads(block)
+            for block in re.findall(
+                r"```json\n(.*?)```", section, re.DOTALL
+            )
+        ]
+        self.assertTrue(blocks, section)
+        example = blocks[0]
+        self.assertEqual(
+            set(example),
+            {"schema", "source", "head", "verdict", "reviewers", "intent"},
+        )
+        self.assertEqual(example["schema"], 1)
+        self.assertEqual(set(example["source"]), {"kind", "ref"})
+        lowered = section.lower()
+        for phrase in (
+            "ancestor",
+            "same tree",
+            "unknown",
+            "malformed",
+            "duplicate",
+            "blank",
+            "non-empty",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, lowered)
+
+    def test_readme_documents_github_bot_and_empty_decision_policy(self) -> None:
+        section = self.readme.split("### GitHub PR approvals", 1)[1].split(
+            "\n### ", 1
+        )[0]
+        lowered = section.lower()
+        self.assertIn("bot", lowered)
+        self.assertIn("people", lowered)
+        self.assertIn("reviewdecision", lowered)
+        self.assertIn("empty", lowered)
+        self.assertIn("current-head approval", lowered)
+
+    def test_readme_documents_gitlab_stale_approval_limitation(self) -> None:
+        section = self.readme.split("### GitLab MR approvals", 1)[1].split(
+            "\n## ", 1
+        )[0]
+        lowered = section.lower()
+        self.assertIn("reset_approvals_on_push", lowered)
+        self.assertIn("stale", lowered)
+        self.assertIn("no per-approval sha", lowered)
+
+    def test_readme_documents_digest_pinning(self) -> None:
+        lowered = self.readme.lower()
+        self.assertIn("docker buildx imagetools inspect", lowered)
+        self.assertIn("digest", lowered)
+        self.assertIn("minimum", lowered)
+        self.assertIn("production", lowered)
+
+    def test_jenkins_stage_fragment_is_additive(self) -> None:
+        path = ROOT / "integrations" / "ci" / "jenkins.stage.groovy"
+        self.assertTrue(path.is_file(), path)
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("stage('Atesto gate')", text)
+        self.assertIn("check --ci", text)
+        self.assertIn("CHANGE_TARGET", text)
+        self.assertNotIn("pipeline {", text)
+        readme = (ROOT / "integrations" / "ci" / "README.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("jenkins.stage.groovy", readme)
+
+
 class ReleaseMetadataTest(unittest.TestCase):
     """Release artifacts must stay consistent with the packaged version."""
 
@@ -3960,6 +4194,63 @@ class ReleaseMetadataTest(unittest.TestCase):
         )[0]
         self.assertNotIn("==", build_system)
         self.assertRegex(build_system, r'setuptools>=[0-9]')
+
+    def test_release_verifies_built_wheel_before_publish(self) -> None:
+        workflow = (
+            ROOT / ".github" / "workflows" / "release.yml"
+        ).read_text(encoding="utf-8")
+        verify = workflow.index("Verify the built wheel")
+        publish = workflow.index("Publish to PyPI")
+        self.assertLess(verify, publish)
+        self.assertLess(workflow.index("sha256sum"), publish)
+        self.assertLess(
+            workflow.index("integrations/github-actions/atesto-gate.yml"),
+            publish,
+        )
+
+    def test_release_build_uses_umask_022(self) -> None:
+        workflow = (
+            ROOT / ".github" / "workflows" / "release.yml"
+        ).read_text(encoding="utf-8")
+        build = workflow.split("- name: Build sdist and wheel", 1)[1]
+        build = build.split("- name:", 1)[0]
+        self.assertIn("umask 022", build)
+
+    def test_release_scopes_id_token_to_the_publish_job(self) -> None:
+        workflow = (
+            ROOT / ".github" / "workflows" / "release.yml"
+        ).read_text(encoding="utf-8")
+        top = workflow.split("jobs:", 1)[0]
+        self.assertNotIn("id-token", top)
+        publish = workflow.split("\n  publish:", 1)[1].split(
+            "\n  container:", 1
+        )[0]
+        self.assertIn("id-token: write", publish)
+        container = workflow.split("\n  container:", 1)[1]
+        self.assertNotIn("id-token", container)
+
+    def test_release_container_smokes_before_pushing(self) -> None:
+        workflow = (
+            ROOT / ".github" / "workflows" / "release.yml"
+        ).read_text(encoding="utf-8")
+        container = workflow.split("\n  container:", 1)[1]
+        self.assertIn("load: true", container)
+        self.assertIn("push: false", container)
+        self.assertIn("tests/container-smoke.sh", container)
+        self.assertIn("docker image inspect", container)
+        self.assertIn("docker push", container)
+        self.assertLess(
+            container.index("load: true"),
+            container.index("tests/container-smoke.sh"),
+        )
+        self.assertLess(
+            container.index("tests/container-smoke.sh"),
+            container.index("docker push"),
+        )
+        self.assertLess(
+            container.index("docker image inspect"),
+            container.index("docker push"),
+        )
 
     def test_changelog_documents_provider_neutral_release(self) -> None:
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
@@ -4114,6 +4405,9 @@ class ContainerMetadataTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        cls.dockerfile_ci = (ROOT / "Dockerfile.ci").read_text(
+            encoding="utf-8"
+        )
         cls.ci = (
             ROOT / ".github" / "workflows" / "container.yml"
         ).read_text(encoding="utf-8")
@@ -4134,23 +4428,46 @@ class ContainerMetadataTest(unittest.TestCase):
             raise AssertionError("gate template nao pina o wheel")
         cls.release_version, cls.release_sha256 = release.groups()
 
-    def test_base_image_is_pinned_python_312_slim(self) -> None:
-        self.assertRegex(
-            self.dockerfile,
-            r"(?m)^FROM python:3\.12-slim@sha256:[0-9a-f]{64}$",
-        )
+    def test_base_images_are_pinned_python_312_slim(self) -> None:
+        for name, text in (
+            ("Dockerfile", self.dockerfile),
+            ("Dockerfile.ci", self.dockerfile_ci),
+        ):
+            with self.subTest(name=name):
+                self.assertRegex(
+                    text,
+                    r"(?m)^FROM python:3\.12-slim@sha256:[0-9a-f]{64}$",
+                )
 
-    def test_installs_git_and_the_hashed_release_wheel(self) -> None:
+    def test_release_dockerfile_installs_the_hashed_pypi_wheel(self) -> None:
         self.assertIn(
             "apt-get install -y --no-install-recommends git", self.dockerfile
         )
         self.assertIn("--require-hashes", self.dockerfile)
         self.assertIn("--no-deps", self.dockerfile)
-        self.assertIn(
-            f"ARG ATESTO_VERSION={self.release_version}", self.dockerfile
+        self.assertIn("ARG ATESTO_VERSION", self.dockerfile)
+        self.assertIn("ARG ATESTO_SHA256", self.dockerfile)
+        self.assertIn('atesto==%s --hash=sha256:%s', self.dockerfile)
+
+    def test_dockerfile_requires_the_version_and_hash_inputs(self) -> None:
+        # The gate template is the single source of the pin. A default here
+        # would duplicate it and silently build a different release.
+        self.assertNotRegex(
+            self.dockerfile, r"(?m)^ARG ATESTO_(?:VERSION|SHA256)="
         )
-        self.assertIn(
-            f"ARG ATESTO_SHA256={self.release_sha256}", self.dockerfile
+
+    def test_ci_dockerfile_installs_the_local_wheel(self) -> None:
+        self.assertIn("COPY dist/ /tmp/dist/", self.dockerfile_ci)
+        self.assertIn("/tmp/dist/atesto-*.whl", self.dockerfile_ci)
+        self.assertIn("--no-deps", self.dockerfile_ci)
+        self.assertNotRegex(
+            self.dockerfile_ci, r"(?m)^RUN .*--require-hashes"
+        )
+        self.assertRegex(self.dockerfile_ci, r"(?m)^USER atesto$")
+        self.assertNotRegex(self.dockerfile_ci, r"(?m)^USER (?:root|0)$")
+        self.assertRegex(self.dockerfile_ci, r"(?m)^WORKDIR /repo$")
+        self.assertRegex(
+            self.dockerfile_ci, r'(?m)^ENTRYPOINT \["atesto"\]$'
         )
 
     def test_runs_as_non_root_in_repo_with_atesto_entrypoint(self) -> None:
@@ -4162,59 +4479,93 @@ class ContainerMetadataTest(unittest.TestCase):
         )
 
     def test_labels_bind_image_to_release_wheel(self) -> None:
-        self.assertIn(
-            'org.opencontainers.image.version="${ATESTO_VERSION}"',
-            self.dockerfile,
-        )
-        self.assertIn(
-            'dev.atesto.wheel-sha256="${ATESTO_SHA256}"', self.dockerfile
-        )
-
-    def test_does_not_install_provider_clis(self) -> None:
-        for cli in ("gh", "glab"):
-            with self.subTest(cli=cli):
-                self.assertNotRegex(
-                    self.dockerfile,
-                    rf"(?m)^.*apt-get install[^\n]*\b{cli}\b",
+        for name, text in (
+            ("Dockerfile", self.dockerfile),
+            ("Dockerfile.ci", self.dockerfile_ci),
+        ):
+            with self.subTest(name=name):
+                self.assertIn(
+                    'org.opencontainers.image.version="${ATESTO_VERSION}"',
+                    text,
+                )
+                self.assertIn(
+                    'dev.atesto.wheel-sha256="${ATESTO_SHA256}"', text
                 )
 
-    def test_ci_builds_and_smokes_on_container_changes(self) -> None:
+    def test_does_not_install_provider_clis(self) -> None:
+        for name, text in (
+            ("Dockerfile", self.dockerfile),
+            ("Dockerfile.ci", self.dockerfile_ci),
+        ):
+            for cli in ("gh", "glab"):
+                with self.subTest(name=name, cli=cli):
+                    self.assertNotRegex(
+                        text,
+                        rf"(?m)^.*apt-get install[^\n]*\b{cli}\b",
+                    )
+
+    def test_ci_builds_a_local_wheel_and_smokes_the_ci_image(self) -> None:
         for trigger in ("push:", "pull_request:"):
             with self.subTest(trigger=trigger):
                 self.assertIn(trigger, self.ci)
         for path in (
             "Dockerfile",
+            "Dockerfile.ci",
             ".github/workflows/container.yml",
             ".github/workflows/container-publish.yml",
             "tests/container-smoke.sh",
+            "pyproject.toml",
+            "src/**",
         ):
             with self.subTest(path=path):
                 self.assertIn(f"- {path}", self.ci)
-        self.assertIn("docker build", self.ci)
+        for step in (
+            "python -m build --no-isolation",
+            "umask 022",
+            "SOURCE_DATE_EPOCH",
+            '"build==1.6.1"',
+            '"setuptools==84.2.1"',
+            '"wheel==0.48.0"',
+            "docker build",
+            "--file Dockerfile.ci",
+        ):
+            with self.subTest(step=step):
+                self.assertIn(step, self.ci)
         self.assertIn(
-            f"tests/container-smoke.sh atesto:smoke {self.release_version}",
+            'tests/container-smoke.sh atesto:smoke "$ATESTO_VERSION"',
             self.ci,
         )
+        self.assertLess(
+            self.ci.index("python -m build --no-isolation"),
+            self.ci.index("docker build"),
+        )
+        self.assertLess(
+            self.ci.index("docker build"),
+            self.ci.index("bash tests/container-smoke.sh"),
+        )
 
-    def test_publish_pushes_version_and_latest_with_release_args(self) -> None:
+    def test_publish_requires_inputs_and_verifies_the_pypi_wheel(self) -> None:
         self.assertIn("workflow_dispatch:", self.publish)
         self.assertIn("packages: write", self.publish)
-        self.assertIn(
-            f'default: "{self.release_version}"', self.publish
+        self.assertGreaterEqual(self.publish.count("required: true"), 2)
+        self.assertNotIn("default:", self.publish)
+        for step in (
+            "pip download",
+            "atesto==${{ inputs.version }}",
+            "sha256sum",
+            "inputs.wheel_sha256",
+            "ATESTO_WHEEL_SHA256",
+            "ATESTO_SHA256=${{ env.ATESTO_WHEEL_SHA256 }}",
+            "ghcr.io/guihirsch/atesto:${{ inputs.version }}",
+            "ghcr.io/guihirsch/atesto:latest",
+        ):
+            with self.subTest(step=step):
+                self.assertIn(step, self.publish)
+        self.assertLess(
+            self.publish.index("Verify the PyPI wheel"),
+            self.publish.index("docker push"),
         )
-        self.assertIn(
-            f'default: "{self.release_sha256}"', self.publish
-        )
-        self.assertIn(
-            "ATESTO_VERSION=${{ inputs.version }}", self.publish
-        )
-        self.assertIn(
-            "ATESTO_SHA256=${{ inputs.wheel_sha256 }}", self.publish
-        )
-        self.assertIn(
-            "ghcr.io/guihirsch/atesto:${{ inputs.version }}", self.publish
-        )
-        self.assertIn("ghcr.io/guihirsch/atesto:latest", self.publish)
+        self.assertIn("tests/container-smoke.sh", self.publish)
 
     def test_smoke_checks_version_user_provider_clis_and_gate(self) -> None:
         self.assertTrue(os.access(self.smoke_path, os.X_OK))
@@ -4245,6 +4596,10 @@ class CISnippetTest(unittest.TestCase):
             "base": "github.base_ref",
         },
         "jenkins.Jenkinsfile": {
+            "history": ["depth: 0", "shallow: false"],
+            "base": "CHANGE_TARGET",
+        },
+        "jenkins.stage.groovy": {
             "history": ["depth: 0", "shallow: false"],
             "base": "CHANGE_TARGET",
         },
