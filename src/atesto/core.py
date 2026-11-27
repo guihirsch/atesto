@@ -32,6 +32,11 @@ CONFIG_NAMES = ("atesto.json", "pstack.json")
 DEFAULT_ARTIFACTS_ROOT = "docs/atesto"
 PROOF_SCHEMA = 1
 REVIEW_SCHEMA = 1
+REVIEW_CONTRACT_KEYS = frozenset(
+    {"schema", "source", "head", "verdict", "reviewers", "intent"}
+)
+REVIEW_SOURCE_KEYS = frozenset({"kind", "ref"})
+REVIEW_SOURCE_KINDS = frozenset({"github", "gitlab", "json"})
 MAX_OUTPUT_BYTES = 2_000_000
 TEST_OUTPUT_TAIL = 4000
 TERMINATION_GRACE_SECONDS = 0.5
@@ -690,6 +695,38 @@ def _validate_proof(
     return data, problems
 
 
+def _validate_review_source(data: dict[str, Any]) -> list[str]:
+    if "source" not in data:
+        return []
+    source = data["source"]
+    if not isinstance(source, dict):
+        return ["review.json source precisa ser objeto"]
+    problems: list[str] = []
+    unknown = sorted(set(source) - REVIEW_SOURCE_KEYS)
+    if unknown:
+        problems.append(
+            "review.json source tem chaves desconhecidas: "
+            + ", ".join(unknown)
+        )
+    missing = sorted(REVIEW_SOURCE_KEYS - set(source))
+    if missing:
+        problems.append(
+            "review.json source tem chaves obrigatorias ausentes: "
+            + ", ".join(missing)
+        )
+    kind = source.get("kind")
+    if not isinstance(kind, str) or kind not in REVIEW_SOURCE_KINDS:
+        problems.append(
+            "review.json source.kind precisa ser github, gitlab ou json"
+        )
+    ref = source.get("ref")
+    if not isinstance(ref, str) or not ref.strip():
+        problems.append(
+            "review.json source.ref precisa ser string nao vazia"
+        )
+    return problems
+
+
 def _validate_review(
     directory: Path,
     root: Path,
@@ -710,6 +747,7 @@ def _validate_review(
     if type(data.get("schema")) is not int or data.get("schema") != REVIEW_SCHEMA:
         problems.append("review.json schema precisa ser 1")
     problems.extend(_validate_tool(data, "review.json"))
+    problems.extend(_validate_review_source(data))
     intent = str(data.get("intent") or "").strip()
     if not intent:
         problems.append("review.json intent vazio")
@@ -1185,6 +1223,42 @@ def make_proof(
     return result.returncode, directory
 
 
+def _write_review_artifact(
+    root: Path,
+    slug: str,
+    *,
+    head: str,
+    tree_sha256: str,
+    intent: str,
+    verdict: str,
+    reviewers: list[str],
+    source: dict[str, str] | None = None,
+) -> Path:
+    config = load_config(root)
+    directory = artifacts_dir(root, config, slug)
+    review: dict[str, Any] = {
+        "schema": REVIEW_SCHEMA,
+        "tool": {"name": TOOL_NAME, "version": VERSION},
+    }
+    if source is not None:
+        review["source"] = source
+    review.update(
+        {
+            "head": head,
+            "tree_sha256": tree_sha256,
+            "intent": intent,
+            "verdict": verdict,
+            "reviewers": reviewers,
+            "findings": [],
+        }
+    )
+    write_regular(
+        directory / "review.json",
+        json.dumps(review, ensure_ascii=True, indent=2) + "\n",
+    )
+    return directory
+
+
 def write_review(
     root: Path,
     slug: str,
@@ -1204,22 +1278,148 @@ def write_review(
     config = load_config(root)
     resolved = resolve_ref(root, head)
     fingerprint = tree_fingerprint(root, config, ref=resolved)
-    directory = artifacts_dir(root, config, slug)
-    review = {
-        "schema": REVIEW_SCHEMA,
-        "tool": {"name": TOOL_NAME, "version": VERSION},
-        "head": resolved,
-        "tree_sha256": fingerprint["tree_sha256"],
-        "intent": intent.strip() or f"review de {slug}",
-        "verdict": verdict,
-        "reviewers": list(dict.fromkeys(reviewers)),
-        "findings": [],
-    }
-    write_regular(
-        directory / "review.json",
-        json.dumps(review, ensure_ascii=True, indent=2) + "\n",
+    return _write_review_artifact(
+        root,
+        slug,
+        head=resolved,
+        tree_sha256=fingerprint["tree_sha256"],
+        intent=intent.strip() or f"review de {slug}",
+        verdict=verdict,
+        reviewers=list(dict.fromkeys(reviewers)),
     )
-    return directory
+
+
+def _contract_error(path: Path, message: str) -> AtestoError:
+    return AtestoError(f"review JSON em {path}: {message}")
+
+
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"chave duplicada: {key}")
+        result[key] = value
+    return result
+
+
+def load_review_contract(path: Path) -> dict[str, Any]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise _contract_error(path, f"ilegivel: {exc}") from exc
+    try:
+        data = json.loads(text, object_pairs_hook=_unique_object)
+    except ValueError as exc:
+        raise _contract_error(path, f"malformado: {exc}") from exc
+    if not isinstance(data, dict):
+        raise _contract_error(path, "precisa ser objeto")
+    unknown = sorted(set(data) - REVIEW_CONTRACT_KEYS)
+    if unknown:
+        raise _contract_error(
+            path, "chaves desconhecidas: " + ", ".join(unknown)
+        )
+    missing = sorted(REVIEW_CONTRACT_KEYS - set(data))
+    if missing:
+        raise _contract_error(
+            path, "chaves obrigatorias ausentes: " + ", ".join(missing)
+        )
+    schema = data["schema"]
+    if type(schema) is not int or schema != 1:
+        raise _contract_error(path, "schema precisa ser 1")
+    source = data["source"]
+    if not isinstance(source, dict):
+        raise _contract_error(path, "source precisa ser objeto")
+    unknown_source = sorted(set(source) - REVIEW_SOURCE_KEYS)
+    if unknown_source:
+        raise _contract_error(
+            path,
+            "source tem chaves desconhecidas: " + ", ".join(unknown_source),
+        )
+    missing_source = sorted(REVIEW_SOURCE_KEYS - set(source))
+    if missing_source:
+        raise _contract_error(
+            path,
+            "source tem chaves obrigatorias ausentes: "
+            + ", ".join(missing_source),
+        )
+    kind = source["kind"]
+    if not isinstance(kind, str) or kind not in REVIEW_SOURCE_KINDS:
+        raise _contract_error(
+            path, "source.kind precisa ser github, gitlab ou json"
+        )
+    ref = source["ref"]
+    if not isinstance(ref, str) or not ref.strip():
+        raise _contract_error(path, "source.ref precisa ser string nao vazia")
+    head = data["head"]
+    if not isinstance(head, str) or not head.strip():
+        raise _contract_error(path, "head precisa ser string nao vazia")
+    verdict = data["verdict"]
+    if not isinstance(verdict, str) or not verdict.strip():
+        raise _contract_error(path, "verdict vazio")
+    verdict = verdict.strip().upper()
+    if verdict not in VALID_VERDICTS:
+        raise _contract_error(
+            path, f"verdict invalido: {verdict} (use APPROVED ou CHANGES_REQUESTED)"
+        )
+    reviewers = data["reviewers"]
+    if (
+        not isinstance(reviewers, list)
+        or not reviewers
+        or not all(
+            isinstance(item, str) and item.strip() for item in reviewers
+        )
+    ):
+        raise _contract_error(
+            path, "reviewers precisa ser lista nao vazia de strings"
+        )
+    intent = data["intent"]
+    if not isinstance(intent, str) or not intent.strip():
+        raise _contract_error(path, "intent precisa ser string nao vazia")
+    return {
+        "source": {"kind": kind, "ref": ref.strip()},
+        "head": head.strip(),
+        "verdict": verdict,
+        "reviewers": list(
+            dict.fromkeys(item.strip() for item in reviewers)
+        ),
+        "intent": intent.strip(),
+    }
+
+
+def write_review_from_json(root: Path, slug: str, path: Path) -> Path:
+    ensure_toplevel(root)
+    contract = load_review_contract(path)
+    config = load_config(root)
+    head = git_head(root)
+    current_tree = tree_fingerprint(root, config, ref=head)
+    try:
+        resolved = resolve_ref(root, contract["head"])
+    except GateError as exc:
+        raise GateError(f"review JSON head invalido: {exc}") from exc
+    # A review binds to the evidence tree, not to a commit id: an evidence-only
+    # commit on top of the approved head does not make the approval stale.
+    if resolved != head:
+        if not is_ancestor(root, resolved, head):
+            raise GateError(
+                f"review JSON head {resolved[:12]} nao e HEAD nem ancestral "
+                f"de {head[:12]}"
+            )
+        approved_tree = tree_fingerprint(root, config, ref=resolved)
+        if approved_tree["tree_sha256"] != current_tree["tree_sha256"]:
+            raise GateError(
+                f"review JSON head {resolved[:12]} e ancestral, mas a arvore "
+                f"mudou em relacao a {head[:12]}"
+            )
+    return _write_review_artifact(
+        root,
+        slug,
+        head=head,
+        tree_sha256=current_tree["tree_sha256"],
+        intent=contract["intent"],
+        verdict=contract["verdict"],
+        reviewers=contract["reviewers"],
+        source=contract["source"],
+    )
 
 
 def init_config(

@@ -1973,6 +1973,455 @@ class AtestoTest(unittest.TestCase):
             )
 
 
+def approval_json(tmp: str, head: str, **fields: object) -> Path:
+    payload: dict[str, object] = {
+        "schema": 1,
+        "source": {"kind": "json", "ref": "change-123"},
+        "head": head,
+        "verdict": "APPROVED",
+        "reviewers": ["alice"],
+        "intent": "aprovar mudanca",
+    }
+    payload.update(fields)
+    path = Path(tmp) / "approval.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+class ReviewFromJsonTest(unittest.TestCase):
+    def test_from_json_writes_source_and_bound_head(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof,review")
+            proof(repo)
+            commit(repo)
+            reviewed = git(repo, "rev-parse", "HEAD")
+            path = approval_json(
+                tmp, reviewed, source={"kind": "json", "ref": "jira-42"}
+            )
+            result = cli(repo, "review", "demo", "--from-json", str(path))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            review_path = repo / "docs" / "atesto" / "demo" / "review.json"
+            artifact = json.loads(review_path.read_text(encoding="utf-8"))
+            self.assertEqual(artifact["schema"], 1)
+            self.assertEqual(
+                artifact["source"], {"kind": "json", "ref": "jira-42"}
+            )
+            self.assertEqual(artifact["head"], reviewed)
+            self.assertEqual(artifact["verdict"], "APPROVED")
+            self.assertEqual(artifact["reviewers"], ["alice"])
+            self.assertEqual(artifact["intent"], "aprovar mudanca")
+            commit(repo, "review")
+            checked = cli(repo, "check", "--json")
+            self.assertEqual(
+                checked.returncode, 0, checked.stdout + checked.stderr
+            )
+            payload = json.loads(checked.stdout)
+            self.assertEqual(
+                payload["review"]["source"],
+                {"kind": "json", "ref": "jira-42"},
+            )
+
+    def test_check_rejects_invalid_artifact_source_shape(self) -> None:
+        invalid_sources: list[object] = [
+            "json",
+            {"kind": "bitbucket", "ref": "change-1"},
+            {"kind": "json"},
+            {"kind": "json", "ref": ""},
+            {"kind": "json", "ref": "change-1", "extra": True},
+        ]
+        for source in invalid_sources:
+            with (
+                self.subTest(source=source),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                repo = make_repo(tmp)
+                init(repo, require="proof,review")
+                proof(repo)
+                commit(repo)
+                reviewed = cli(
+                    repo,
+                    "review",
+                    "demo",
+                    "--reviewer",
+                    "alice",
+                )
+                self.assertEqual(
+                    reviewed.returncode, 0, reviewed.stdout + reviewed.stderr
+                )
+                review_path = repo / "docs" / "atesto" / "demo" / "review.json"
+                data = json.loads(review_path.read_text(encoding="utf-8"))
+                data["source"] = source
+                review_path.write_text(json.dumps(data), encoding="utf-8")
+                commit(repo, "source")
+                result = cli(repo, "check")
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("source", result.stdout)
+
+    def test_check_accepts_old_review_without_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof,review")
+            proof(repo)
+            commit(repo)
+            reviewed = cli(repo, "review", "demo", "--reviewer", "alice")
+            self.assertEqual(
+                reviewed.returncode, 0, reviewed.stdout + reviewed.stderr
+            )
+            artifact = json.loads(
+                (
+                    repo / "docs" / "atesto" / "demo" / "review.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertNotIn("source", artifact)
+            commit(repo, "review")
+            checked = cli(repo, "check", "--json")
+            self.assertEqual(
+                checked.returncode, 0, checked.stdout + checked.stderr
+            )
+            payload = json.loads(checked.stdout)
+            self.assertNotIn("source", payload["review"])
+
+    def test_from_json_rejects_manual_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            head = git(repo, "rev-parse", "HEAD")
+            path = approval_json(tmp, head)
+            for flag in (
+                ["--head", "HEAD"],
+                ["--verdict", "APPROVED"],
+                ["--reviewer", "alice"],
+                ["--intent", "manual"],
+            ):
+                with self.subTest(flag=flag):
+                    result = cli(
+                        repo,
+                        "review",
+                        "demo",
+                        "--from-json",
+                        str(path),
+                        *flag,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(
+                        "nao combina", result.stdout + result.stderr
+                    )
+                    self.assertFalse(
+                        (
+                            repo
+                            / "docs"
+                            / "atesto"
+                            / "demo"
+                            / "review.json"
+                        ).exists()
+                    )
+
+    def test_from_json_rejects_invalid_contract_shapes(self) -> None:
+        base: dict[str, object] = {
+            "schema": 1,
+            "source": {"kind": "json", "ref": "change-123"},
+            "head": "",
+            "verdict": "APPROVED",
+            "reviewers": ["alice"],
+            "intent": "aprovar mudanca",
+        }
+        cases: list[tuple[str, dict[str, object], str]] = [
+            ("schema 2", {"schema": 2}, "schema"),
+            ("schema bool", {"schema": True}, "schema"),
+            ("schema string", {"schema": "1"}, "schema"),
+            ("source string", {"source": "json"}, "source"),
+            (
+                "source kind",
+                {"source": {"kind": "bitbucket", "ref": "x"}},
+                "source.kind",
+            ),
+            ("source missing ref", {"source": {"kind": "json"}}, "source"),
+            (
+                "source blank ref",
+                {"source": {"kind": "json", "ref": "  "}},
+                "source.ref",
+            ),
+            (
+                "source extra key",
+                {"source": {"kind": "json", "ref": "x", "extra": 1}},
+                "source",
+            ),
+            ("blank head", {"head": "  "}, "head"),
+            ("head null", {"head": None}, "head"),
+            ("invalid verdict", {"verdict": "MAYBE"}, "verdict"),
+            ("blank intent", {"intent": " "}, "intent"),
+            ("reviewer blank", {"reviewers": ["alice", " "]}, "reviewers"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            head = git(repo, "rev-parse", "HEAD")
+            path = Path(tmp) / "approval.json"
+            for name, fields, expected in cases:
+                with self.subTest(case=name):
+                    payload = {**base, "head": head, **fields}
+                    path.write_text(json.dumps(payload), encoding="utf-8")
+                    result = cli(
+                        repo, "review", "demo", "--from-json", str(path)
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(
+                        expected, result.stdout + result.stderr
+                    )
+                    self.assertFalse(
+                        (
+                            repo
+                            / "docs"
+                            / "atesto"
+                            / "demo"
+                            / "review.json"
+                        ).exists()
+                    )
+
+    def test_from_json_rejects_duplicate_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            head = git(repo, "rev-parse", "HEAD")
+            path = Path(tmp) / "approval.json"
+            path.write_text(
+                "{"
+                '"schema": 1,'
+                '"source": {"kind": "json", "ref": "change-1"},'
+                f'"head": "{head}",'
+                '"verdict": "APPROVED",'
+                '"verdict": "CHANGES_REQUESTED",'
+                '"reviewers": ["alice"],'
+                '"intent": "aprovar"'
+                "}",
+                encoding="utf-8",
+            )
+            result = cli(repo, "review", "demo", "--from-json", str(path))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("duplicad", result.stdout + result.stderr)
+            self.assertFalse(
+                (repo / "docs" / "atesto" / "demo" / "review.json").exists()
+            )
+
+    def test_from_json_rejects_non_object_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            path = Path(tmp) / "approval.json"
+            path.write_text(json.dumps(["not", "an", "object"]), encoding="utf-8")
+            result = cli(repo, "review", "demo", "--from-json", str(path))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("objeto", result.stdout + result.stderr)
+
+    def test_from_json_dedupes_reviewers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            head = git(repo, "rev-parse", "HEAD")
+            path = approval_json(
+                tmp, head, reviewers=["alice", "alice", "bob"]
+            )
+            result = cli(repo, "review", "demo", "--from-json", str(path))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            artifact = json.loads(
+                (
+                    repo / "docs" / "atesto" / "demo" / "review.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(artifact["reviewers"], ["alice", "bob"])
+
+    def test_from_json_accepts_all_source_kinds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            head = git(repo, "rev-parse", "HEAD")
+            path = Path(tmp) / "approval.json"
+            for kind in ("github", "gitlab", "json"):
+                with self.subTest(kind=kind):
+                    path = approval_json(
+                        tmp, head, source={"kind": kind, "ref": f"{kind}-1"}
+                    )
+                    result = cli(
+                        repo, "review", "demo", "--from-json", str(path)
+                    )
+                    self.assertEqual(
+                        result.returncode, 0, result.stdout + result.stderr
+                    )
+                    artifact = json.loads(
+                        (
+                            repo
+                            / "docs"
+                            / "atesto"
+                            / "demo"
+                            / "review.json"
+                        ).read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(
+                        artifact["source"],
+                        {"kind": kind, "ref": f"{kind}-1"},
+                    )
+
+    def test_from_json_rejects_unknown_top_level_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            head = git(repo, "rev-parse", "HEAD")
+            path = approval_json(tmp, head, extra="typo")
+            result = cli(repo, "review", "demo", "--from-json", str(path))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("extra", result.stdout + result.stderr)
+            self.assertFalse(
+                (repo / "docs" / "atesto" / "demo" / "review.json").exists()
+            )
+
+    def test_from_json_accepts_ancestor_with_same_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof")
+            commit(repo, "config")
+            approved = git(repo, "rev-parse", "HEAD")
+            proof(repo)
+            commit(repo, "evidence")
+            current = git(repo, "rev-parse", "HEAD")
+            self.assertNotEqual(approved, current)
+            path = approval_json(tmp, approved)
+            result = cli(repo, "review", "demo", "--from-json", str(path))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            artifact = json.loads(
+                (
+                    repo / "docs" / "atesto" / "demo" / "review.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(artifact["head"], current)
+
+    def test_from_json_rejects_ancestor_with_changed_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            approved = git(repo, "rev-parse", "HEAD")
+            (repo / "app.py").write_text("x = 2\n", encoding="utf-8")
+            commit(repo, "code")
+            path = approval_json(tmp, approved)
+            result = cli(repo, "review", "demo", "--from-json", str(path))
+            self.assertNotEqual(result.returncode, 0)
+            output = result.stdout + result.stderr
+            self.assertIn("arvore", output)
+            self.assertFalse(
+                (repo / "docs" / "atesto" / "demo" / "review.json").exists()
+            )
+
+    def test_from_json_rejects_non_ancestor_head(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            git(repo, "checkout", "-qb", "other")
+            (repo / "app.py").write_text("x = 3\n", encoding="utf-8")
+            commit(repo, "other")
+            other = git(repo, "rev-parse", "HEAD")
+            git(repo, "checkout", "-q", "-")
+            path = approval_json(tmp, other)
+            result = cli(repo, "review", "demo", "--from-json", str(path))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("ancestral", result.stdout + result.stderr)
+            self.assertFalse(
+                (repo / "docs" / "atesto" / "demo" / "review.json").exists()
+            )
+
+    def test_from_json_rejects_unresolvable_head(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            path = approval_json(tmp, "deadbeef")
+            result = cli(repo, "review", "demo", "--from-json", str(path))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("deadbeef", result.stdout + result.stderr)
+
+    def test_from_json_rejects_malformed_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            path = Path(tmp) / "approval.json"
+            path.write_text("{not json", encoding="utf-8")
+            result = cli(repo, "review", "demo", "--from-json", str(path))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("JSON", result.stdout + result.stderr)
+            self.assertFalse(
+                (repo / "docs" / "atesto" / "demo" / "review.json").exists()
+            )
+
+    def test_from_json_rejects_missing_or_blank_verdict(self) -> None:
+        for fields in ({"verdict": ""}, {"verdict": "   "}, {"verdict": None}):
+            with self.subTest(fields=fields), tempfile.TemporaryDirectory() as tmp:
+                repo = make_repo(tmp)
+                init(repo)
+                head = git(repo, "rev-parse", "HEAD")
+                payload = {
+                    "schema": 1,
+                    "source": {"kind": "json", "ref": "change-123"},
+                    "head": head,
+                    "verdict": "APPROVED",
+                    "reviewers": ["alice"],
+                    "intent": "aprovar mudanca",
+                }
+                payload.update(fields)
+                path = Path(tmp) / "approval.json"
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                result = cli(
+                    repo, "review", "demo", "--from-json", str(path)
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("verdict", result.stdout + result.stderr)
+                self.assertFalse(
+                    (
+                        repo
+                        / "docs"
+                        / "atesto"
+                        / "demo"
+                        / "review.json"
+                    ).exists()
+                )
+
+    def test_from_json_rejects_empty_reviewers(self) -> None:
+        for value in ([], ["  "], None, "alice"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as tmp:
+                repo = make_repo(tmp)
+                init(repo)
+                head = git(repo, "rev-parse", "HEAD")
+                path = approval_json(tmp, head, reviewers=value)
+                result = cli(
+                    repo, "review", "demo", "--from-json", str(path)
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("reviewers", result.stdout + result.stderr)
+                self.assertFalse(
+                    (
+                        repo
+                        / "docs"
+                        / "atesto"
+                        / "demo"
+                        / "review.json"
+                    ).exists()
+                )
+
+
+class ReviewSchemaTest(unittest.TestCase):
+    def test_optional_source_matches_loader_contract(self) -> None:
+        schema = json.loads(
+            (
+                SRC / "atesto" / "schemas" / "review.schema.json"
+            ).read_text(encoding="utf-8")
+        )
+        source = schema["properties"]["source"]
+        self.assertNotIn("source", schema["required"])
+        self.assertEqual(set(source["required"]), set(core.REVIEW_SOURCE_KEYS))
+        self.assertEqual(
+            set(source["properties"]["kind"]["enum"]),
+            set(core.REVIEW_SOURCE_KINDS),
+        )
+        self.assertIs(source["additionalProperties"], False)
+
+
 class ConfigSchemaTest(unittest.TestCase):
     """The published schema must agree with the loader's version registry."""
 
