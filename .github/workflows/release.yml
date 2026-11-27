@@ -35,3 +35,82 @@ jobs:
         run: python -m build --no-isolation
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+  container:
+    # Publish the image only after the wheel is on PyPI, and derive its hash
+    # from the published wheel instead of duplicating a pin in this workflow.
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download the published wheel
+        run: |
+          mkdir -p dist
+          for attempt in 1 2 3 4 5 6; do
+            if python -m pip download \
+              --no-deps \
+              --only-binary=:all: \
+              --dest dist \
+              "atesto==0.3.0"; then
+              break
+            fi
+            if [ "$attempt" -eq 6 ]; then
+              exit 1
+            fi
+            sleep 15
+          done
+      - name: Verify the published wheel against the template pin
+        run: |
+          wheel="dist/atesto-0.3.0-py3-none-any.whl"
+          published_sha256="$(sha256sum "$wheel" | cut -d' ' -f1)"
+          pinned_sha256="$(
+            grep -oE 'sha256:[0-9a-f]{64}' \
+              integrations/github-actions/atesto-gate.yml |
+              head -n 1 | cut -d: -f2
+          )"
+          echo "published wheel: $published_sha256"
+          echo "template pin:    $pinned_sha256"
+          test -n "$pinned_sha256"
+          test "$published_sha256" = "$pinned_sha256"
+          echo "ATESTO_WHEEL_SHA256=$published_sha256" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          build-args: |
+            ATESTO_VERSION=0.3.0
+            ATESTO_SHA256=${{ env.ATESTO_WHEEL_SHA256 }}
+          tags: |
+            ghcr.io/guihirsch/atesto:0.3.0
+            ghcr.io/guihirsch/atesto:latest
+      - name: Smoke the published image
+        run: bash tests/container-smoke.sh ghcr.io/guihirsch/atesto:0.3.0 0.3.0
+      - name: Verify the published image labels
+        run: |
+          image="ghcr.io/guihirsch/atesto:0.3.0"
+          version="$(docker image inspect \
+            --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' \
+            "$image")"
+          wheel_sha256="$(docker image inspect \
+            --format '{{ index .Config.Labels "dev.atesto.wheel-sha256" }}' \
+            "$image")"
+          echo "image version:    $version"
+          echo "image wheel hash: $wheel_sha256"
+          test "$version" = "0.3.0"
+          test "$wheel_sha256" = "$ATESTO_WHEEL_SHA256"

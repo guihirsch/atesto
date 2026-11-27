@@ -13,7 +13,7 @@
 atesto-gate:
   stage: test
   image:
-    name: ghcr.io/guihirsch/atesto:0.2.0
+    name: ghcr.io/guihirsch/atesto:0.3.0
     entrypoint: [""]
   variables:
     # Fetch the complete history so `check --ci` can read the base config.

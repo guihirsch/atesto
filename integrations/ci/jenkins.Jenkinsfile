@@ -47,7 +47,7 @@ pipeline {
           # writable; the image itself runs as non-root.
           docker run --rm --user "$(id -u):$(id -g)" \
             -v "$WORKSPACE:/repo" -w /repo \
-            ghcr.io/guihirsch/atesto:0.2.0 \
+            ghcr.io/guihirsch/atesto:0.3.0 \
             check --ci --base "$BASE_REF"
         '''
       }

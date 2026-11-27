@@ -27,4 +27,4 @@ jobs:
       - name: Build image
         run: docker build --tag atesto:smoke .
       - name: Smoke test
-        run: bash tests/container-smoke.sh atesto:smoke 0.2.0
+        run: bash tests/container-smoke.sh atesto:smoke 0.3.0

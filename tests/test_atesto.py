@@ -3961,14 +3961,110 @@ class ReleaseMetadataTest(unittest.TestCase):
         self.assertNotIn("==", build_system)
         self.assertRegex(build_system, r'setuptools>=[0-9]')
 
-    def test_changelog_documents_breaking_release(self) -> None:
+    def test_changelog_documents_provider_neutral_release(self) -> None:
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         marker = f"## [{package_version()}]"
         self.assertIn(marker, changelog)
-        entry = changelog.split(marker, 1)[1].split("\n## [", 1)[0]
+        entry = (
+            changelog.split(marker, 1)[1].split("\n## [", 1)[0].lower()
+        )
+        for term in (
+            "--from-json",
+            "--from-github-pr",
+            "--from-gitlab-mr",
+            "container",
+            "snippet",
+            "readme",
+        ):
+            with self.subTest(term=term):
+                self.assertIn(term, entry)
+
+    def test_changelog_keeps_020_breaking_migration(self) -> None:
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn("## [0.2.0]", changelog)
+        entry = changelog.split("## [0.2.0]", 1)[1].split("\n## [", 1)[0]
         self.assertRegex(entry, r"(?i)breaking")
         self.assertIn("desconhecid", entry)
         self.assertIn("adaptador", entry)
+
+    def test_readme_quickstart_reaches_green_check(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("## Quick start", readme)
+        section = readme.split("## Quick start", 1)[1].split("\n## ", 1)[0]
+        for command in (
+            f'python -m pip install "atesto=={package_version()}"',
+            "git init",
+            "atesto init --require proof,review",
+            "atesto proof demo",
+            "atesto review demo",
+            "git add docs/atesto/demo",
+            "git commit",
+            "atesto check",
+            "atesto: ok",
+        ):
+            with self.subTest(command=command):
+                self.assertIn(command, section)
+        self.assertLess(
+            section.index("atesto proof demo"),
+            section.index("atesto check"),
+        )
+
+    def test_readme_documents_threat_model_and_host_enforcement(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("## Threat model", readme)
+        section = readme.split("## Threat model", 1)[1].split("\n## ", 1)[0]
+        lowered = section.lower()
+        for phrase in (
+            "self-reported",
+            "does not prove",
+            "host",
+            "admin",
+            "bypass",
+            "gitlab",
+            "token",
+            "head",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, lowered)
+
+    def test_readme_documents_release_verification(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        section = readme.split("## Release", 1)[1].split("\n## ", 1)[0]
+        lowered = section.lower()
+        for phrase in (
+            "pip download",
+            "sha256sum",
+            "umask 022",
+            "docker pull",
+            f"ghcr.io/guihirsch/atesto:{package_version()}",
+            "published",
+            "post-merge",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, lowered)
+
+    def test_release_publishes_container_with_verified_wheel(self) -> None:
+        workflow = (
+            ROOT / ".github" / "workflows" / "release.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("container:", workflow)
+        self.assertRegex(workflow, r"needs:\s*publish")
+        self.assertIn("packages: write", workflow)
+        self.assertIn(f"atesto=={package_version()}", workflow)
+        self.assertIn("sha256sum", workflow)
+        self.assertIn(
+            "integrations/github-actions/atesto-gate.yml", workflow
+        )
+        self.assertIn(
+            "ATESTO_SHA256=${{ env.ATESTO_WHEEL_SHA256 }}", workflow
+        )
+        self.assertIn(
+            f"ghcr.io/guihirsch/atesto:{package_version()}", workflow
+        )
+        self.assertIn("ghcr.io/guihirsch/atesto:latest", workflow)
+        self.assertIn("docker image inspect", workflow)
+        self.assertIn("org.opencontainers.image.version", workflow)
+        self.assertIn("dev.atesto.wheel-sha256", workflow)
 
     def test_readme_documents_v2_contract(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -4063,6 +4159,15 @@ class ContainerMetadataTest(unittest.TestCase):
         self.assertRegex(self.dockerfile, r"(?m)^WORKDIR /repo$")
         self.assertRegex(
             self.dockerfile, r'(?m)^ENTRYPOINT \["atesto"\]$'
+        )
+
+    def test_labels_bind_image_to_release_wheel(self) -> None:
+        self.assertIn(
+            'org.opencontainers.image.version="${ATESTO_VERSION}"',
+            self.dockerfile,
+        )
+        self.assertIn(
+            'dev.atesto.wheel-sha256="${ATESTO_SHA256}"', self.dockerfile
         )
 
     def test_does_not_install_provider_clis(self) -> None:
