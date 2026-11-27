@@ -52,6 +52,7 @@ atesto --version
 atesto init [--artifacts-root docs/atesto] [--require proof,review] [--test-cmd CMD]
 atesto proof [--root .] [--no-output] <slug> -- <command>
 atesto review <slug> [--head HEAD] [--verdict APPROVED] [--reviewer NAME]...
+atesto review <slug> [--from-json PATH | --from-github-pr N]
 atesto check [--root .] [--base origin/main] [--slug SLUG] [--ci] [--json]
 atesto doctor [--root .]
 atesto hooks install|uninstall|status [--root .] [--force]
@@ -60,6 +61,50 @@ atesto fingerprint [--root .] [--ref REF]
 
 `--ci` fails closed when `atesto.json` is not present in the base ref. A PR
 cannot initialize its own gate.
+
+## Review sources
+
+Manual review is the default:
+
+```bash
+atesto review demo --head HEAD --verdict APPROVED --reviewer alice
+```
+
+For automation, `review` accepts exactly one source. A source flag cannot be
+combined with another source or with the manual `--head`, `--verdict`,
+`--reviewer` and `--intent` flags.
+
+- `--from-json PATH` reads the strict review JSON contract v1.
+- `--from-github-pr N` reads a GitHub PR through `gh`.
+
+### GitHub PR approvals
+
+`gh` must be installed and authenticated (`gh auth login` or `GH_TOKEN`);
+Atesto never reads or stores provider tokens. The adapter reads the PR head and
+all reviews with:
+
+```bash
+gh api --paginate --slurp repos/{owner}/{repo}/pulls/N/reviews
+```
+
+The adapter then:
+
+- counts only `APPROVED` reviews whose `commit_id` is the PR head;
+- keeps the latest review per login (a later comment does not revoke an
+  approval; a dismissal does), dedupes logins and sorts them;
+- fails closed on `CHANGES_REQUESTED`, `REVIEW_REQUIRED`, no current-head
+  approval, a local `HEAD` that differs from the PR head, missing or
+  unauthenticated `gh`, malformed output, and provider HTTP errors; no
+  `review.json` is written on failure;
+- writes `source: {"kind": "github", "ref": "<PR URL>"}` and leaves
+  `min_reviewers` enforcement to `check`.
+
+The adapter uses whatever repository `gh` resolves (the current clone, or
+`GH_REPO`). Inside a fork `gh` resolves the fork, so to read approvals for an
+upstream PR run from an upstream clone or set
+`GH_REPO=<upstream-owner>/<repo>`; Atesto does not guess the upstream
+repository. Check out the PR head locally (for example `gh pr checkout N`)
+before running the command.
 
 ## Config
 
