@@ -17,6 +17,10 @@ Every snippet pins `ghcr.io/guihirsch/atesto:0.3.0`, fetches full history, sets
 must match `pyproject.toml`; `tests/test_atesto.py::CISnippetTest` fails when a
 snippet drifts.
 
+The published 0.3.0 image digest is
+`sha256:bdd41341c8a1dc9a7cfb535f4288aa889ac1a754877dc67bcb2673a9f59daa19`;
+prefer it in production.
+
 `jenkins.stage.groovy` is the additive form: paste the stage inside an
 existing `stages { ... }` block instead of copying a whole pipeline.
 
