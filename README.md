@@ -52,7 +52,7 @@ atesto --version
 atesto init [--artifacts-root docs/atesto] [--require proof,review] [--test-cmd CMD]
 atesto proof [--root .] [--no-output] <slug> -- <command>
 atesto review <slug> [--head HEAD] [--verdict APPROVED] [--reviewer NAME]...
-atesto review <slug> [--from-json PATH | --from-github-pr N]
+atesto review <slug> [--from-json PATH | --from-github-pr N | --from-gitlab-mr IID]
 atesto check [--root .] [--base origin/main] [--slug SLUG] [--ci] [--json]
 atesto doctor [--root .]
 atesto hooks install|uninstall|status [--root .] [--force]
@@ -76,6 +76,7 @@ combined with another source or with the manual `--head`, `--verdict`,
 
 - `--from-json PATH` reads the strict review JSON contract v1.
 - `--from-github-pr N` reads a GitHub PR through `gh`.
+- `--from-gitlab-mr IID` reads a GitLab MR through `glab`.
 
 ### GitHub PR approvals
 
@@ -105,6 +106,40 @@ upstream PR run from an upstream clone or set
 `GH_REPO=<upstream-owner>/<repo>`; Atesto does not guess the upstream
 repository. Check out the PR head locally (for example `gh pr checkout N`)
 before running the command.
+
+### GitLab MR approvals
+
+`glab` must be installed and authenticated (`glab auth login` or
+`GITLAB_TOKEN`). Atesto never reads or stores provider tokens. The adapter
+reads the MR and its approvals with:
+
+```bash
+glab api "projects/<project>/merge_requests/IID"
+glab api "projects/<project>/merge_requests/IID/approvals"
+```
+
+When the job exports `CI_MERGE_REQUEST_PROJECT_ID` (the MR target, including
+fork pipelines) or `CI_PROJECT_ID`, the adapter uses that numeric project id.
+Outside CI it uses the `:fullpath` placeholder, so `glab` resolves the project
+from the current clone. For a fork MR, run from a clone of the target project
+or export the target project id.
+
+The adapter then:
+
+- requires the MR `sha` to be exactly the local `HEAD`;
+- fails on `detailed_merge_status` `requested_changes` or `not_approved`, and
+  on unresolved blocking discussions (`blocking_discussions_resolved: false`);
+- requires `approved: true` and at least one login in `approved_by`;
+- dedupes and sorts approver usernames and leaves `min_reviewers` enforcement
+  to `check`;
+- fails closed on missing or unauthenticated `glab`, 401/403 responses,
+  malformed output and provider HTTP errors; no `review.json` is written on
+  failure;
+- writes `source: {"kind": "gitlab", "ref": "<MR URL>"}`.
+
+GitLab requires authentication to read `/approvals`; `CI_JOB_TOKEN` is not
+allowed to call that endpoint, so provide `GITLAB_TOKEN` with `read_api` (or
+`api`) scope. Check out the MR head locally before running the command.
 
 ## Config
 

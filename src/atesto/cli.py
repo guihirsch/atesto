@@ -82,6 +82,17 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="grava o review a partir das aprovacoes do PR N via gh",
     )
+    review.add_argument(
+        "--from-gitlab-mr",
+        metavar="IID",
+        type=_positive_int,
+        default=None,
+        help=(
+            "grava o review a partir das aprovacoes do MR IID via glab "
+            "(projeto: CI_MERGE_REQUEST_PROJECT_ID/CI_PROJECT_ID no CI; "
+            "senao o remote do repo)"
+        ),
+    )
 
     check = sub.add_parser("check", help="valida prova/review no head")
     check.add_argument("--root", default=".")
@@ -174,6 +185,7 @@ def _run_review(args: argparse.Namespace) -> int:
         for flag, value in (
             ("--from-json", args.from_json),
             ("--from-github-pr", args.from_github_pr),
+            ("--from-gitlab-mr", args.from_gitlab_mr),
         )
         if value is not None
     ]
@@ -193,6 +205,10 @@ def _run_review(args: argparse.Namespace) -> int:
     elif args.from_github_pr is not None:
         directory = core.write_review_from_github(
             root, args.slug, args.from_github_pr
+        )
+    elif args.from_gitlab_mr is not None:
+        directory = core.write_review_from_gitlab(
+            root, args.slug, args.from_gitlab_mr
         )
     else:
         directory = core.write_review(

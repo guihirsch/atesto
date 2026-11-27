@@ -138,6 +138,52 @@ else:
 """
 
 
+FAKE_GLAB_SCRIPT = """\
+#!{python}
+import json
+import os
+import sys
+
+with open(os.environ["FAKE_PROVIDER_SCENARIO"], encoding="utf-8") as handle:
+    scenario = json.load(handle)
+args = sys.argv[1:]
+with open(os.environ["FAKE_PROVIDER_LOG"], "a", encoding="utf-8") as log:
+    log.write(
+        json.dumps(
+            {{
+                "args": args,
+                "cwd": os.getcwd(),
+                "CI_PROJECT_ID": os.environ.get("CI_PROJECT_ID"),
+                "CI_MERGE_REQUEST_PROJECT_ID": os.environ.get(
+                    "CI_MERGE_REQUEST_PROJECT_ID"
+                ),
+            }}
+        )
+    )
+    log.write("\\n")
+endpoint = args[-1] if args else ""
+if endpoint.endswith("/approvals"):
+    key = "approvals"
+elif "/merge_requests/" in endpoint:
+    key = "mr"
+else:
+    sys.stderr.write(
+        "fake glab: comando inesperado: " + " ".join(args) + "\\n"
+    )
+    raise SystemExit(97)
+payload = scenario[key]
+exit_code = payload.get("exit", 0)
+if exit_code:
+    sys.stdout.write(payload.get("stdout", ""))
+    sys.stderr.write(payload.get("stderr", ""))
+    raise SystemExit(exit_code)
+if "stdout" in payload:
+    sys.stdout.write(payload["stdout"])
+else:
+    json.dump(payload.get("json"), sys.stdout)
+"""
+
+
 def fake_provider_cli(
     tmp: str, name: str, script: str, scenario: dict
 ) -> dict[str, str]:
@@ -211,6 +257,56 @@ def github_review(
 
 def github_reviews(*pages: list[dict[str, object]]) -> dict[str, object]:
     return {"json": list(pages)}
+
+
+def fake_glab(
+    tmp: str,
+    *,
+    mr: dict,
+    approvals: dict,
+    project: str = "",
+    merge_request_project: str = "",
+) -> dict[str, str]:
+    env = fake_provider_cli(
+        tmp,
+        "glab",
+        FAKE_GLAB_SCRIPT.format(python=sys.executable),
+        {"mr": mr, "approvals": approvals},
+    )
+    # Keep the tests deterministic: the developer/CI environment may export
+    # GitLab variables of its own.
+    env["CI_PROJECT_ID"] = project
+    env["CI_MERGE_REQUEST_PROJECT_ID"] = merge_request_project
+    return env
+
+
+def glab_calls(tmp: str) -> list[dict[str, object]]:
+    return provider_calls(tmp, "glab")
+
+
+def gitlab_mr(head: str, url: str, **fields: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "sha": head,
+        "detailed_merge_status": "mergeable",
+        "blocking_discussions_resolved": True,
+        "web_url": url,
+    }
+    payload.update(fields)
+    return {"json": payload}
+
+
+def gitlab_approvals(
+    *logins: str, approved: bool = True
+) -> dict[str, object]:
+    return {
+        "json": {
+            "approved": approved,
+            "approved_by": [
+                {"user": {"id": index + 1, "username": login}}
+                for index, login in enumerate(logins)
+            ],
+        }
+    }
 
 
 class AtestoTest(unittest.TestCase):
@@ -3153,6 +3249,539 @@ class ReviewFromGithubTest(unittest.TestCase):
                 {call["cwd"] for call in gh_calls(tmp)},
                 {str(repo.resolve())},
             )
+
+
+class ReviewFromGitlabTest(unittest.TestCase):
+    def test_from_gitlab_writes_source_and_bound_head(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof,review")
+            proof(repo)
+            commit(repo)
+            head = git(repo, "rev-parse", "HEAD")
+            url = "https://gitlab.com/acme/repo/-/merge_requests/42"
+            env = fake_glab(
+                tmp,
+                mr=gitlab_mr(head, url),
+                approvals=gitlab_approvals("alice", "bob", "alice"),
+            )
+            result = cli(
+                repo, "review", "demo", "--from-gitlab-mr", "42", env=env
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            artifact = json.loads(
+                (
+                    repo / "docs" / "atesto" / "demo" / "review.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(artifact["source"], {"kind": "gitlab", "ref": url})
+            self.assertEqual(artifact["head"], head)
+            self.assertEqual(artifact["verdict"], "APPROVED")
+            self.assertEqual(artifact["reviewers"], ["alice", "bob"])
+            self.assertTrue(artifact["intent"].strip())
+            commit(repo, "review")
+            checked = cli(repo, "check", "--json")
+            self.assertEqual(
+                checked.returncode, 0, checked.stdout + checked.stderr
+            )
+            payload = json.loads(checked.stdout)
+            self.assertEqual(
+                payload["review"]["source"], {"kind": "gitlab", "ref": url}
+            )
+            calls = glab_calls(tmp)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(
+                calls[0]["args"],
+                ["api", "projects/:fullpath/merge_requests/42"],
+            )
+            self.assertEqual(
+                calls[1]["args"],
+                ["api", "projects/:fullpath/merge_requests/42/approvals"],
+            )
+            self.assertEqual(
+                {call["cwd"] for call in calls}, {str(repo.resolve())}
+            )
+
+    def test_from_gitlab_sha_mismatch_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            old = git(repo, "rev-parse", "HEAD")
+            (repo / "app.py").write_text("x = 2\n", encoding="utf-8")
+            commit(repo, "code")
+            env = fake_glab(
+                tmp,
+                mr=gitlab_mr(
+                    old, "https://gitlab.com/acme/repo/-/merge_requests/7"
+                ),
+                approvals=gitlab_approvals("alice"),
+            )
+            result = cli(
+                repo, "review", "demo", "--from-gitlab-mr", "7", env=env
+            )
+            self.assertNotEqual(result.returncode, 0)
+            output = (result.stdout + result.stderr).lower()
+            self.assertIn("sha", output)
+            self.assertIn("head", output)
+            self.assertIn("checkout", output)
+            self.assertFalse(
+                (repo / "docs" / "atesto" / "demo" / "review.json").exists()
+            )
+
+    def test_from_gitlab_requires_at_least_one_approval(self) -> None:
+        cases = {
+            "empty approved_by": gitlab_approvals(),
+            "approved false": gitlab_approvals("alice", approved=False),
+        }
+        for name, approvals in cases.items():
+            with (
+                self.subTest(case=name),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                repo = make_repo(tmp)
+                init(repo)
+                head = git(repo, "rev-parse", "HEAD")
+                env = fake_glab(
+                    tmp,
+                    mr=gitlab_mr(
+                        head, "https://gitlab.com/acme/repo/-/merge_requests/8"
+                    ),
+                    approvals=approvals,
+                )
+                result = cli(
+                    repo, "review", "demo", "--from-gitlab-mr", "8", env=env
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "aprov", (result.stdout + result.stderr).lower()
+                )
+                self.assertFalse(
+                    (
+                        repo / "docs" / "atesto" / "demo" / "review.json"
+                    ).exists()
+                )
+
+    def test_from_gitlab_blocking_merge_status_fails_closed(self) -> None:
+        cases = {
+            "requested_changes": "requested changes",
+            "not_approved": "not_approved",
+        }
+        for status, expected in cases.items():
+            with (
+                self.subTest(status=status),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                repo = make_repo(tmp)
+                init(repo)
+                head = git(repo, "rev-parse", "HEAD")
+                env = fake_glab(
+                    tmp,
+                    mr=gitlab_mr(
+                        head,
+                        "https://gitlab.com/acme/repo/-/merge_requests/9",
+                        detailed_merge_status=status,
+                    ),
+                    approvals=gitlab_approvals("alice"),
+                )
+                result = cli(
+                    repo, "review", "demo", "--from-gitlab-mr", "9", env=env
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    expected, (result.stdout + result.stderr).lower()
+                )
+                self.assertFalse(
+                    (
+                        repo / "docs" / "atesto" / "demo" / "review.json"
+                    ).exists()
+                )
+
+    def test_from_gitlab_unresolved_blocking_discussions_fails_closed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            head = git(repo, "rev-parse", "HEAD")
+            env = fake_glab(
+                tmp,
+                mr=gitlab_mr(
+                    head,
+                    "https://gitlab.com/acme/repo/-/merge_requests/10",
+                    blocking_discussions_resolved=False,
+                ),
+                approvals=gitlab_approvals("alice"),
+            )
+            result = cli(
+                repo, "review", "demo", "--from-gitlab-mr", "10", env=env
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "discuss", (result.stdout + result.stderr).lower()
+            )
+            self.assertFalse(
+                (repo / "docs" / "atesto" / "demo" / "review.json").exists()
+            )
+
+    def test_from_gitlab_missing_cli_fails_with_actionable_message(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            bin_dir = Path(tmp) / "bin"
+            bin_dir.mkdir()
+            git_binary = shutil.which("git")
+            self.assertIsNotNone(git_binary)
+            (bin_dir / "git").symlink_to(git_binary)
+            result = cli(
+                repo,
+                "review",
+                "demo",
+                "--from-gitlab-mr",
+                "11",
+                env={
+                    "PATH": str(bin_dir),
+                    "CI_PROJECT_ID": "",
+                    "CI_MERGE_REQUEST_PROJECT_ID": "",
+                },
+            )
+            self.assertNotEqual(result.returncode, 0)
+            output = (result.stdout + result.stderr).lower()
+            self.assertIn("glab", output)
+            self.assertIn("nao encontrado", output)
+            self.assertIn("instale", output)
+            self.assertFalse(
+                (repo / "docs" / "atesto" / "demo" / "review.json").exists()
+            )
+
+    def test_from_gitlab_unauthenticated_fails_with_actionable_message(
+        self,
+    ) -> None:
+        cases = [
+            {
+                "exit": 1,
+                "stderr": (
+                    "glab is not authenticated; run `glab auth login` "
+                    "to authenticate\n"
+                ),
+            },
+            {
+                "exit": 1,
+                "stderr": "glab: 401 Unauthorized (HTTP 401)\n",
+            },
+        ]
+        for payload in cases:
+            with (
+                self.subTest(stderr=payload["stderr"]),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                repo = make_repo(tmp)
+                init(repo)
+                env = fake_glab(
+                    tmp, mr=payload, approvals={"json": {}}
+                )
+                result = cli(
+                    repo, "review", "demo", "--from-gitlab-mr", "12", env=env
+                )
+                self.assertNotEqual(result.returncode, 0)
+                output = (result.stdout + result.stderr).lower()
+                self.assertIn("nao autenticado", output)
+                self.assertIn("glab auth login", output)
+                self.assertIn("gitlab_token", output)
+                self.assertFalse(
+                    (
+                        repo / "docs" / "atesto" / "demo" / "review.json"
+                    ).exists()
+                )
+
+    def test_from_gitlab_403_approvals_explains_required_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            head = git(repo, "rev-parse", "HEAD")
+            env = fake_glab(
+                tmp,
+                mr=gitlab_mr(
+                    head, "https://gitlab.com/acme/repo/-/merge_requests/13"
+                ),
+                approvals={
+                    "exit": 1,
+                    "stdout": '{"message":"403 Forbidden"}',
+                    "stderr": "glab: 403 Forbidden (HTTP 403)\n",
+                },
+            )
+            env["CI_JOB_TOKEN"] = "job-token"
+            result = cli(
+                repo, "review", "demo", "--from-gitlab-mr", "13", env=env
+            )
+            self.assertNotEqual(result.returncode, 0)
+            output = (result.stdout + result.stderr).lower()
+            self.assertIn("403", output)
+            self.assertIn("gitlab_token", output)
+            self.assertIn("ci_job_token", output)
+            self.assertFalse(
+                (repo / "docs" / "atesto" / "demo" / "review.json").exists()
+            )
+
+    def test_from_gitlab_malformed_output_fails_closed(self) -> None:
+        url = "https://gitlab.com/acme/repo/-/merge_requests/15"
+
+        def mr_json(head: str, **fields: object) -> dict[str, object]:
+            return dict(gitlab_mr(head, url)["json"], **fields)
+
+        cases: list[tuple[str, object, dict, str]] = [
+            (
+                "metadata not json",
+                lambda head: {"stdout": "{not json"},
+                gitlab_approvals("alice"),
+                "malformado",
+            ),
+            (
+                "metadata not object",
+                lambda head: {"json": []},
+                gitlab_approvals("alice"),
+                "objeto",
+            ),
+            (
+                "bad sha",
+                lambda head: {"json": mr_json(head, sha="abc")},
+                gitlab_approvals("alice"),
+                "sha",
+            ),
+            (
+                "bad merge status",
+                lambda head: {
+                    "json": mr_json(head, detailed_merge_status=1)
+                },
+                gitlab_approvals("alice"),
+                "detailed_merge_status",
+            ),
+            (
+                "bad blocking flag",
+                lambda head: {
+                    "json": mr_json(
+                        head, blocking_discussions_resolved="yes"
+                    )
+                },
+                gitlab_approvals("alice"),
+                "blocking_discussions_resolved",
+            ),
+            (
+                "bad url",
+                lambda head: {"json": mr_json(head, web_url="  ")},
+                gitlab_approvals("alice"),
+                "web_url",
+            ),
+            (
+                "approvals not object",
+                lambda head: {"json": mr_json(head)},
+                {"json": []},
+                "objeto",
+            ),
+            (
+                "approved not bool",
+                lambda head: {"json": mr_json(head)},
+                {
+                    "json": {
+                        "approved": "yes",
+                        "approved_by": [{"user": {"username": "alice"}}],
+                    }
+                },
+                "approved",
+            ),
+            (
+                "approved_by not list",
+                lambda head: {"json": mr_json(head)},
+                {"json": {"approved": True, "approved_by": {}}},
+                "approved_by",
+            ),
+            (
+                "approved_by entry not object",
+                lambda head: {"json": mr_json(head)},
+                {"json": {"approved": True, "approved_by": ["alice"]}},
+                "approved_by",
+            ),
+            (
+                "approved_by missing username",
+                lambda head: {"json": mr_json(head)},
+                {"json": {"approved": True, "approved_by": [{"user": {}}]}},
+                "username",
+            ),
+        ]
+        for name, make_mr, approvals, expected in cases:
+            with (
+                self.subTest(case=name),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                repo = make_repo(tmp)
+                init(repo)
+                head = git(repo, "rev-parse", "HEAD")
+                env = fake_glab(
+                    tmp, mr=make_mr(head), approvals=approvals
+                )
+                result = cli(
+                    repo, "review", "demo", "--from-gitlab-mr", "15", env=env
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    expected, (result.stdout + result.stderr).lower()
+                )
+                self.assertFalse(
+                    (
+                        repo / "docs" / "atesto" / "demo" / "review.json"
+                    ).exists()
+                )
+
+    def test_from_gitlab_mr_http_error_checks_exit_before_stdout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            env = fake_glab(
+                tmp,
+                mr={
+                    "exit": 1,
+                    "stdout": '{"message":"404 Not Found"}',
+                    "stderr": "glab: 404 Not Found (HTTP 404)\n",
+                },
+                approvals=gitlab_approvals("alice"),
+            )
+            result = cli(
+                repo, "review", "demo", "--from-gitlab-mr", "16", env=env
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("404", result.stdout + result.stderr)
+            self.assertFalse(
+                (repo / "docs" / "atesto" / "demo" / "review.json").exists()
+            )
+
+    def test_from_gitlab_uses_ci_project_id(self) -> None:
+        cases = [
+            ("CI_PROJECT_ID", "1234", "5678"),
+            ("CI_PROJECT_ID", "1234", ""),
+            ("CI_MERGE_REQUEST_PROJECT_ID", "1234", "5678"),
+        ]
+        for name, project, mr_project in cases:
+            expected = mr_project or project
+            with (
+                self.subTest(name=name, project=project, mr_project=mr_project),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                repo = make_repo(tmp)
+                init(repo)
+                head = git(repo, "rev-parse", "HEAD")
+                env = fake_glab(
+                    tmp,
+                    mr=gitlab_mr(
+                        head,
+                        "https://gitlab.com/acme/repo/-/merge_requests/17",
+                    ),
+                    approvals=gitlab_approvals("alice"),
+                    project=project,
+                    merge_request_project=mr_project,
+                )
+                result = cli(
+                    repo, "review", "demo", "--from-gitlab-mr", "17", env=env
+                )
+                self.assertEqual(
+                    result.returncode, 0, result.stdout + result.stderr
+                )
+                calls = glab_calls(tmp)
+                self.assertEqual(
+                    calls[0]["args"],
+                    [
+                        "api",
+                        f"projects/{expected}/merge_requests/17",
+                    ],
+                )
+
+    def test_from_gitlab_rejects_invalid_ci_project_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            head = git(repo, "rev-parse", "HEAD")
+            env = fake_glab(
+                tmp,
+                mr=gitlab_mr(
+                    head, "https://gitlab.com/acme/repo/-/merge_requests/18"
+                ),
+                approvals=gitlab_approvals("alice"),
+                project="acme/repo",
+            )
+            result = cli(
+                repo, "review", "demo", "--from-gitlab-mr", "18", env=env
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("CI_PROJECT_ID", result.stdout + result.stderr)
+            self.assertEqual(glab_calls(tmp), [])
+            self.assertFalse(
+                (repo / "docs" / "atesto" / "demo" / "review.json").exists()
+            )
+
+    def test_from_gitlab_rejects_manual_flags_and_other_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo)
+            head = git(repo, "rev-parse", "HEAD")
+            path = approval_json(tmp, head)
+            for extra in (
+                ["--head", "HEAD"],
+                ["--verdict", "APPROVED"],
+                ["--reviewer", "alice"],
+                ["--intent", "manual"],
+                ["--from-json", str(path)],
+                ["--from-github-pr", "19"],
+            ):
+                with self.subTest(extra=extra):
+                    result = cli(
+                        repo,
+                        "review",
+                        "demo",
+                        "--from-gitlab-mr",
+                        "19",
+                        *extra,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    output = (result.stdout + result.stderr).lower()
+                    self.assertTrue(
+                        "nao combina" in output or "apenas uma fonte" in output
+                    )
+                    self.assertFalse(
+                        (
+                            repo
+                            / "docs"
+                            / "atesto"
+                            / "demo"
+                            / "review.json"
+                        ).exists()
+                    )
+
+    def test_from_gitlab_keeps_min_reviewers_for_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(tmp)
+            init(repo, require="proof,review")
+            config_path = repo / "atesto.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["min_reviewers"] = 2
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            proof(repo)
+            commit(repo)
+            head = git(repo, "rev-parse", "HEAD")
+            env = fake_glab(
+                tmp,
+                mr=gitlab_mr(
+                    head, "https://gitlab.com/acme/repo/-/merge_requests/20"
+                ),
+                approvals=gitlab_approvals("alice", "alice"),
+            )
+            result = cli(
+                repo, "review", "demo", "--from-gitlab-mr", "20", env=env
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            commit(repo, "review")
+            checked = cli(repo, "check")
+            self.assertEqual(checked.returncode, 1)
+            self.assertIn("pelo menos 2", checked.stdout)
 
 
 class ReviewSchemaTest(unittest.TestCase):
